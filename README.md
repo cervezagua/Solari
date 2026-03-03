@@ -6,6 +6,7 @@ Each timezone lives in its own frameless, draggable, always-on-top window with a
 Named after the iconic **Solari di Udine** split-flap boards found in airports and train stations worldwide.
 
 ---
+<img width="400" height="400" alt="image" src="https://github.com/user-attachments/assets/1e06f069-d5f7-4fa8-803c-d73b855b49d4" />
 
 ## 📦 Files
 
