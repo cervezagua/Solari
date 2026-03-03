@@ -32,6 +32,7 @@ pyinstaller ^
   --onefile ^
   --windowed ^
   --name "Solari" ^
+  --icon "solari.ico" ^
   --hidden-import zoneinfo ^
   --hidden-import tzdata ^
   --hidden-import pystray ^
