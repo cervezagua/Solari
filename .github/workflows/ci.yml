@@ -1,8 +1,10 @@
 name: CI
 
 on:
+  # Branch pushes are covered by pull_request; listing "**" here as well ran
+  # the whole matrix twice per push.
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
