@@ -875,11 +875,15 @@ CHASSIS_SS = 2
 
 
 @functools.lru_cache(maxsize=48)
-def render_chassis(w, h, pad, radius, well, accent):
-    """Full widget background. `well` is the recessed rect in unscaled coords."""
+def render_chassis(w, h, pad, radius, well_radius, well, accent):
+    """Full widget background. `well` is the recessed rect in unscaled coords.
+
+    `radius` is the panel's own corner radius and may be 0 for a flush edge;
+    `well_radius` is independent, so the recess keeps its rounding either way.
+    """
     s = CHASSIS_SS
     W, H = w * s, h * s
-    P, R = pad * s, max(2, radius * s)
+    P, R = pad * s, max(0, radius * s)
     base = THEME["chassis"]
 
     img = Image.new("RGB", (W, H), "#000000")
@@ -906,12 +910,14 @@ def render_chassis(w, h, pad, radius, well, accent):
         outline=(255, 255, 255, 255), width=lw)
     rim.putalpha(Image.composite(_vramp(W, H, 74, 12, 0.0, 0.75),
                                  Image.new("L", (W, H), 0), rim.split()[3]))
-    layer = Image.alpha_composite(layer, rim)
+    # In place: rebinding `layer` here would orphan the ImageDraw bound to it,
+    # silently discarding everything drawn afterwards (the well and its shading).
+    layer.alpha_composite(rim)
 
     # Recessed well: flat fill, because card corners pre-blend against exactly
     # this colour, plus an inner shadow confined to its padding ring.
     x1, y1, x2, y2 = (v * s for v in well)
-    wr = max(2, int(radius * s * 0.6))
+    wr = max(2, int(well_radius * s))
     d.rounded_rectangle([x1, y1, x2, y2], radius=wr, fill=THEME["well"])
 
     depth = max(1, int(s * 2))
@@ -919,8 +925,17 @@ def render_chassis(w, h, pad, radius, well, accent):
         a = int(120 * (1.0 - i / (depth * 3)))
         d.rounded_rectangle([x1 + i, y1 + i, x2 - i, y2 - i], radius=max(1, wr - i),
                             outline=(0, 0, 0, a), width=1)
-    # Light catching the bottom lip of the recess
-    d.arc([x1, y1, x2, y2], start=20, end=160, fill=(255, 255, 255, 26), width=lw)
+    # Light catching the bottom lip of the recess.  This has to follow the
+    # well's rounded outline masked to its lower half - an ImageDraw.arc over
+    # the well's bounding box draws an ellipse the full width of the widget,
+    # which reads as a stray curve rather than an edge.
+    lip = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ImageDraw.Draw(lip).rounded_rectangle(
+        [x1, y1, x2, y2], radius=wr, outline=(255, 255, 255, 255), width=lw)
+    top = y1 / H + (y2 - y1) / H * 0.55      # ramp within the well, not the image
+    lip.putalpha(Image.composite(_vramp(W, H, 0, 40, top, y2 / H),
+                                 Image.new("L", (W, H), 0), lip.split()[3]))
+    layer.alpha_composite(lip)
 
     img = Image.alpha_composite(img.convert("RGBA"), layer).convert("RGB")
 
@@ -1022,7 +1037,11 @@ class ClockWindow(tk.Toplevel):
             # shows up as a black border around the widget, because an
             # overrideredirect Tk window has no transparency to blend into.
             "pad": 0,
-            "r": max(5, int(11 * s)),
+            # Flush outer edge.  The resize grip in the bottom-right corner is
+            # square, so rounding the other three made that corner look broken.
+            # At radius 0 there is also no black left anywhere in the window.
+            "r": 0,
+            "wr": max(3, int(13 * s)),
             "mx": max(8, int(14 * s)),
             "my": max(6, int(10 * s)),
             "hdr": max(16, int(26 * s)),
@@ -1124,7 +1143,8 @@ class ClockWindow(tk.Toplevel):
         if HAS_PIL:
             accent = tc if tc.lower() not in ("#ffffff", "#aaaaaa") else None
             self._photo = ImageTk.PhotoImage(
-                render_chassis(L["w"], L["h"], L["pad"], L["r"], L["well"], accent))
+                render_chassis(L["w"], L["h"], L["pad"], L["r"], L["wr"],
+                               L["well"], accent))
             cv.itemconfigure(self._bg, image=self._photo)
         else:
             cv.itemconfigure(self._bg, state="hidden")

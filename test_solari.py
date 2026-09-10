@@ -312,8 +312,25 @@ class Rendering(unittest.TestCase):
         self.assertEqual(S.render_card.cache_info().hits, before + 1)
 
     def test_chassis_size(self):
-        img = S.render_chassis(400, 200, 8, 16, (20, 50, 380, 150), None)
+        img = S.render_chassis(400, 200, 0, 0, 12, (20, 50, 380, 150), None)
         self.assertEqual(img.size, (400, 200))
+
+    def test_chassis_well_rounds_independently_of_the_panel(self):
+        """A flush panel must not flatten the recess: the well radius used to
+        be derived from the panel radius, so squaring one squared the other."""
+        well = (20, 50, 380, 150)
+        flat = S.render_chassis(400, 200, 0, 0, 0, well, None)
+        curved = S.render_chassis(400, 200, 0, 0, 24, well, None)
+        # Compare the whole corner box rather than one pixel: a single probe a
+        # couple of px in looks identical either way once downsampled.
+        differing = sum(
+            1
+            for x in range(20, 46)
+            for y in range(50, 76)
+            if flat.getpixel((x, y)) != curved.getpixel((x, y))
+        )
+        self.assertGreater(differing, 40,
+                           "well radius is not honoured independently")
 
     def test_app_icon(self):
         self.assertEqual(S.make_app_icon(64).size, (64, 64))
@@ -443,30 +460,38 @@ class ClockWindowBehaviour(unittest.TestCase):
             self.assertIsNotNone(shown_digit(self.win._cards[key]))
 
     @unittest.skipUnless(S.HAS_PIL, "Pillow not installed")
-    def test_chassis_reaches_every_window_edge(self):
-        """No outer mat.
+    def test_chassis_fills_the_window_including_corners(self):
+        """No outer mat, and a flush outer edge.
 
         The panel used to sit inset inside a black surround, which read as a
-        border drawn around the widget. An overrideredirect Tk window has no
-        transparency to blend into, so any inset is simply visible black.
+        border drawn around the widget; an overrideredirect Tk window has no
+        transparency to blend into, so any inset is simply visible black. The
+        corners then had to go square too - the resize grip in the bottom-right
+        is square, so rounding only the other three looked broken.
         """
         for scale in (0.4, 1.0, 2.2):
             self.win._scale = scale
             L = self.win._layout()
             self.assertEqual(L["pad"], 0, f"outer mat came back at scale {scale}")
-            img = S.render_chassis(L["w"], L["h"], L["pad"], L["r"],
+            self.assertEqual(L["r"], 0, f"panel is rounded again at scale {scale}")
+            self.assertGreater(L["wr"], 0, "the recessed well should stay rounded")
+            img = S.render_chassis(L["w"], L["h"], L["pad"], L["r"], L["wr"],
                                    L["well"], None)
             w, h = img.size
-            edges = {
-                "top": img.getpixel((w // 2, 0)),
-                "bottom": img.getpixel((w // 2, h - 1)),
-                "left": img.getpixel((0, h // 2)),
-                "right": img.getpixel((w - 1, h // 2)),
+            probes = {
+                "top": (w // 2, 0),
+                "bottom": (w // 2, h - 1),
+                "left": (0, h // 2),
+                "right": (w - 1, h // 2),
+                "top-left": (0, 0),
+                "top-right": (w - 1, 0),
+                "bottom-left": (0, h - 1),
+                "bottom-right": (w - 1, h - 1),
             }
-            for name, px in edges.items():
+            for name, xy in probes.items():
                 self.assertGreater(
-                    sum(px), 12,
-                    f"{name} edge is black at scale {scale} - the mat is back")
+                    sum(img.getpixel(xy)), 12,
+                    f"{name} is black at scale {scale} - panel does not reach it")
 
     def test_digits_survive_a_rescale(self):
         self.win.on_second(time.time(), animate=True)
