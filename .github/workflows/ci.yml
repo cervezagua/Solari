@@ -16,7 +16,7 @@ jobs:
     name: Tests (Linux)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # The system interpreter is used deliberately: setup-python's Linux
       # builds do not reliably ship _tkinter, and every test imports solari,
@@ -51,8 +51,8 @@ jobs:
       matrix:
         python: ["3.10", "3.13"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
 
@@ -72,8 +72,8 @@ jobs:
     runs-on: windows-latest
     needs: windows
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -92,7 +92,7 @@ jobs:
           dist\Solari.exe --selftest
           if errorlevel 1 exit /b 1
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: Solari-exe
           path: dist/Solari.exe
