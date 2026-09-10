@@ -92,7 +92,7 @@ jobs:
           dist\Solari.exe --selftest
           if errorlevel 1 exit /b 1
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v6
         with:
           name: Solari-exe
           path: dist/Solari.exe
