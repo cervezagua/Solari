@@ -46,8 +46,9 @@ Named after the iconic **Solari di Udine** split-flap boards found in airports a
 
 ## 🖥 Usage
 
-- **Manager window** opens on launch — it lists every clock you own, with a live
-  time preview and per-clock **✎ edit**, **Find**, and **✕ remove**
+- **Manager window** opens on launch — it lists every clock you own as a row
+  striped in that clock's own colour, with a live time preview and per-clock
+  **✎ edit**, **Find**, and **✕ remove**
 - **Drag** any clock window anywhere on screen — it snaps to screen edges and to
   other clocks. Hold **Shift** while dragging to place it freely
 - **Drag ◢ corner** → resize the clock
@@ -122,6 +123,14 @@ run uploads the built exe as an artifact.
 - **Nothing is redrawn per frame.** Canvas items are created once and animated
   with `coords()` / `itemconfigure()`. Card faces and the window chassis are
   rendered once per style and cached.
+- **One shading model for the whole app.** `render_surface` draws every raised
+  and recessed surface — flip cards, manager rows, buttons, the toggle — so the
+  manager matches the clocks by construction rather than by copied constants.
+  Tk's own Button is a flat colour block that cannot carry a gradient, specular
+  edge or bevel, so the buttons are canvases with a rendered face.
+- **The widget's outer edge is flush.** The resize grip in the bottom-right
+  corner is square, so the panel is too; there is no black anywhere in the
+  window. The recess and the cards keep their rounding.
 - **High-DPI aware on Windows**, so the app renders at native resolution instead
   of being bitmap-stretched by the OS. Clock-face text is pixel-sized to stay
   locked to the cards; UI text follows the display DPI.

@@ -525,85 +525,113 @@ def _vramp(w, h, a0, a1, p0=0.0, p1=1.0):
     return img
 
 
-@functools.lru_cache(maxsize=96)
-def render_card(w, h, radius, card_color, rim_color, behind, rolling):
-    """One card face as an RGB PIL image, already blended onto `behind`.
-
-    Shading model: lit from above.  A three-stop body gradient with a touch of
-    bounce light at the base, a specular highlight that fades down the top
-    corners, a matching shadow rising from the bottom, and a faint inner bevel.
-    `rim_color` adds a neon inner glow; `rolling` bakes in the drum-interior
-    shade used while a digit is scrolling.
-    """
-    s = CARD_SS
-    W, H, R = w * s, h * s, max(1, radius * s)
-
-    body = _vgrad(W, H, [
-        (0.00, lighten(card_color, 0.17)),
-        (0.50, card_color),
-        (0.88, darken(card_color, 0.62)),
-        (1.00, darken(card_color, 0.80)),   # bounce light off the base
+def _body_gradient(W, H, fill, inset, strength):
+    """The lit-from-above body. Inverted for a recessed surface."""
+    if inset:
+        return _vgrad(W, H, [
+            (0.00, darken(fill, 1.0 - 0.34 * strength)),
+            (0.55, fill),
+            (1.00, lighten(fill, 0.10 * strength)),
+        ])
+    return _vgrad(W, H, [
+        (0.00, lighten(fill, 0.17 * strength)),
+        (0.50, fill),
+        (0.88, darken(fill, 1.0 - 0.38 * strength)),
+        (1.00, darken(fill, 1.0 - 0.20 * strength)),   # bounce light off the base
     ])
-    if rolling:
-        # Recessed drum interior: darken the middle band the digit travels through
-        shade = _vramp(W, H, 0, 0, 0.0, 0.0)
-        d = ImageDraw.Draw(shade)
-        band = int(H * 0.62)
-        top = (H - band) // 2
-        for i in range(band):
-            t = i / max(1, band - 1)
-            # smooth bell, strongest at the centre of the travel
-            v = int(86 * (1.0 - abs(2.0 * t - 1.0)) ** 0.8)
-            d.line([(0, top + i), (W, top + i)], fill=v)
-        body = Image.composite(Image.new("RGB", (W, H), "#000000"), body, shade)
+
+
+@functools.lru_cache(maxsize=192)
+def render_surface(w, h, radius, fill, behind, glow=None, inset=False,
+                   strength=1.0, ss=CARD_SS):
+    """A shaded surface as an RGB PIL image, already blended onto `behind`.
+
+    This is the app's one shading model, shared by the flip cards, the manager's
+    rows and every button, so they match by construction rather than by
+    eyeballed constants.
+
+    Lit from above: a body gradient with a touch of bounce light at the base, a
+    specular highlight fading down the top corners, a contact shadow rising from
+    the bottom, and a faint inner bevel.  `inset=True` inverts the lighting for
+    a recessed surface (a well, or a pressed button).  `glow` adds a coloured
+    inner rim.  Corners are pre-blended against `behind`, so the result is
+    opaque and drops straight onto a canvas.
+    """
+    W, H, R = w * ss, h * ss, max(0, radius * ss)
+    body = _body_gradient(W, H, fill, inset, strength)
 
     mask = Image.new("L", (W, H), 0)
     ImageDraw.Draw(mask).rounded_rectangle([0, 0, W - 1, H - 1], radius=R, fill=255)
 
-    card = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    card.paste(body, (0, 0), mask)
+    surf = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    surf.paste(body, (0, 0), mask)
 
-    lw = max(1, int(s * 1.2))
+    lw = max(1, int(ss * 1.2))
+    edge = [lw // 2, lw // 2, W - 1 - lw // 2, H - 1 - lw // 2]
 
-    # Specular top edge - fades away down the shoulders
-    spec = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    ImageDraw.Draw(spec).rounded_rectangle(
-        [lw // 2, lw // 2, W - 1 - lw // 2, H - 1 - lw // 2],
-        radius=R, outline=(255, 255, 255, 255), width=lw)
-    spec.putalpha(Image.composite(_vramp(W, H, 132, 0, 0.0, 0.42), Image.new("L", (W, H), 0), spec.split()[3]))
-    card = Image.alpha_composite(card, spec)
+    def _edge_layer(colour, a0, a1, p0, p1):
+        layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        ImageDraw.Draw(layer).rounded_rectangle(edge, radius=R, outline=colour,
+                                                width=lw)
+        layer.putalpha(Image.composite(_vramp(W, H, a0, a1, p0, p1),
+                                       Image.new("L", (W, H), 0),
+                                       layer.split()[3]))
+        return layer
 
-    # Contact shadow rising from the base
-    shadow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    ImageDraw.Draw(shadow).rounded_rectangle(
-        [lw // 2, lw // 2, W - 1 - lw // 2, H - 1 - lw // 2],
-        radius=R, outline=(0, 0, 0, 255), width=lw)
-    shadow.putalpha(Image.composite(_vramp(W, H, 0, 150, 0.55, 1.0), Image.new("L", (W, H), 0), shadow.split()[3]))
-    card = Image.alpha_composite(card, shadow)
+    hi = int(132 * strength)
+    lo = int(150 * strength)
+    if inset:
+        # Recessed: shadow across the top, light along the bottom lip.
+        surf = Image.alpha_composite(surf, _edge_layer((0, 0, 0, 255), lo, 0, 0.0, 0.5))
+        surf = Image.alpha_composite(surf, _edge_layer((255, 255, 255, 255), 0, hi, 0.6, 1.0))
+    else:
+        surf = Image.alpha_composite(surf, _edge_layer((255, 255, 255, 255), hi, 0, 0.0, 0.42))
+        surf = Image.alpha_composite(surf, _edge_layer((0, 0, 0, 255), 0, lo, 0.55, 1.0))
 
-    # Inner bevel - a second, inset edge that sells thickness
-    bevel = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    inset = lw * 2
-    ImageDraw.Draw(bevel).rounded_rectangle(
-        [inset, inset, W - 1 - inset, H - 1 - inset],
-        radius=max(1, R - inset), outline=(255, 255, 255, 255), width=max(1, lw // 2))
-    bevel.putalpha(Image.composite(_vramp(W, H, 46, 0, 0.0, 0.30), Image.new("L", (W, H), 0), bevel.split()[3]))
-    card = Image.alpha_composite(card, bevel)
+        # Inner bevel - a second, inset edge that sells thickness
+        bevel = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        pad = lw * 2
+        ImageDraw.Draw(bevel).rounded_rectangle(
+            [pad, pad, W - 1 - pad, H - 1 - pad], radius=max(0, R - pad),
+            outline=(255, 255, 255, 255), width=max(1, lw // 2))
+        bevel.putalpha(Image.composite(_vramp(W, H, int(46 * strength), 0, 0.0, 0.30),
+                                       Image.new("L", (W, H), 0), bevel.split()[3]))
+        surf = Image.alpha_composite(surf, bevel)
 
-    # Neon inner rim
-    if rim_color:
-        rr, gg, bb = to_rgb(rim_color)
-        glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-        ImageDraw.Draw(glow).rounded_rectangle(
-            [lw, lw, W - 1 - lw, H - 1 - lw],
-            radius=max(1, R - lw), outline=(rr, gg, bb, 210), width=lw)
-        glow = glow.filter(ImageFilter.GaussianBlur(s * 1.6))
-        glow.putalpha(Image.composite(glow.split()[3], Image.new("L", (W, H), 0), mask))
-        card = Image.alpha_composite(card, glow)
+    if glow:
+        rr, gg, bb = to_rgb(glow)
+        halo = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        ImageDraw.Draw(halo).rounded_rectangle(
+            [lw, lw, W - 1 - lw, H - 1 - lw], radius=max(0, R - lw),
+            outline=(rr, gg, bb, 210), width=lw)
+        halo = halo.filter(ImageFilter.GaussianBlur(ss * 1.6))
+        halo.putalpha(Image.composite(halo.split()[3], Image.new("L", (W, H), 0), mask))
+        surf = Image.alpha_composite(surf, halo)
 
     out = Image.new("RGB", (W, H), behind)
-    out.paste(card, (0, 0), card)
+    out.paste(surf, (0, 0), surf)
     return out.resize((w, h), Image.LANCZOS)
+
+
+@functools.lru_cache(maxsize=96)
+def render_card(w, h, radius, card_color, rim_color, behind, rolling):
+    """One flip card face: the shared surface, plus the drum-interior shade."""
+    base = render_surface(w, h, radius, card_color, behind, glow=rim_color)
+    if not rolling:
+        return base
+
+    # Recessed drum interior: darken the band the digit travels through.  A
+    # soft vertical falloff needs no supersampling, so this works at final size.
+    shade = Image.new("L", (w, h), 0)
+    d = ImageDraw.Draw(shade)
+    band = max(1, int(h * 0.62))
+    top = (h - band) // 2
+    for i in range(band):
+        t = i / max(1, band - 1)
+        # smooth bell, strongest at the centre of the travel
+        d.line([(0, top + i), (w, top + i)],
+               fill=int(86 * (1.0 - abs(2.0 * t - 1.0)) ** 0.8))
+    return Image.composite(Image.new("RGB", (w, h), "#000000"), base, shade)
 
 
 # ---------------------------------------------------------------------------
@@ -1443,23 +1471,184 @@ def day_offset_label(dt, local_now=None):
 # ---------------------------------------------------------------------------
 #  Shared widgets
 # ---------------------------------------------------------------------------
+# fill, text, hover fill, hover text.  Entries are THEME keys, or literal
+# colours that pass straight through.
 _BTN_STYLES = {
     "primary": ("accent", "#ffffff", "accent_hi", "#ffffff"),
     "ghost": ("surface", "text_dim", "surface_hi", "text"),
-    "danger": ("surface", "text_dim", "surface_hi", "danger"),
+    "danger": ("surface", "text_dim", "danger", "#ffffff"),
     "flat": ("bg", "text_faint", "surface", "text"),
 }
 
 
+class SurfaceButton(tk.Canvas):
+    """A button drawn with render_surface, so it matches the flip cards.
+
+    Tk's own Button is a flat colour block with no way to carry a gradient, a
+    specular edge or a bevel, which is why the manager never looked related to
+    the widgets it manages.
+    """
+
+    def __init__(self, parent, text, command, kind="ghost", font=None,
+                 padx=14, pady=8, width=None, height=None, behind=None,
+                 radius=9, **kw):
+        self._fill, self._fg, self._hover_fill, self._hover_fg = (
+            THEME.get(v, v) for v in _BTN_STYLES[kind])
+        self._behind = behind or THEME["bg"]
+        self._radius = radius
+        self._command = command
+        self._font = font or ui_font(10)
+        self._enabled = True
+        self._state = "normal"
+        self._photos = {}            # strong refs; a collected one blanks the button
+
+        f = tkinter.font.Font(font=self._font)
+        w = width or f.measure(text) + padx * 2
+        h = height or f.metrics("linespace") + pady * 2
+        super().__init__(parent, width=w, height=h, highlightthickness=0, bd=0,
+                         bg=self._behind, takefocus=0, cursor="hand2", **kw)
+        self._cw, self._ch = w, h   # not _w: Tk stores the widget path there
+        self._img = self.create_image(0, 0, anchor="nw")
+        self._txt = self.create_text(w // 2, h // 2, text=text, font=self._font,
+                                     fill=self._fg, anchor="center")
+        self._paint("normal")
+
+        self.bind("<Enter>", lambda e: self._paint("hover"))
+        self.bind("<Leave>", lambda e: self._paint("normal"))
+        self.bind("<ButtonPress-1>", lambda e: self._paint("pressed"))
+        self.bind("<ButtonRelease-1>", self._release)
+        self.bind("<Configure>", self._on_configure)
+
+    # -- painting ----------------------------------------------------------
+    def _paint(self, state):
+        if not self._enabled:
+            state = "normal"
+        self._state = state
+        if HAS_PIL:
+            key = (state, self._cw, self._ch)
+            photo = self._photos.get(key)
+            if photo is None:
+                fill = self._hover_fill if state == "hover" else self._fill
+                photo = ImageTk.PhotoImage(render_surface(
+                    self._cw, self._ch, self._radius, fill, self._behind,
+                    inset=(state == "pressed")))
+                self._photos[key] = photo
+            self.itemconfigure(self._img, image=photo, state="normal")
+        else:
+            self.configure(bg=self._hover_fill if state == "hover" else self._fill)
+        fg = self._hover_fg if state == "hover" else self._fg
+        if not self._enabled:
+            fg = THEME["text_faint"]
+        self.itemconfigure(self._txt, fill=fg)
+
+    def _on_configure(self, e):
+        # Re-render only on a real size change; reacting to every event would
+        # loop, because painting can itself trigger <Configure>.
+        if (e.width, e.height) == (self._cw, self._ch):
+            return
+        self._cw, self._ch = e.width, e.height
+        self._photos.clear()
+        self.coords(self._txt, self._cw // 2, self._ch // 2)
+        self._paint(self._state)
+
+    def _release(self, e):
+        inside = 0 <= e.x < self._cw and 0 <= e.y < self._ch
+        self._paint("hover" if inside else "normal")
+        if inside and self._enabled and self._command:
+            self._command()
+
+    # -- public ------------------------------------------------------------
+    def set_text(self, text):
+        self.itemconfigure(self._txt, text=text)
+
+    def set_enabled(self, enabled):
+        self._enabled = bool(enabled)
+        self.configure(cursor="hand2" if enabled else "")
+        self._paint("normal")
+
+
 def make_button(parent, text, command, kind="ghost", **kw):
-    # Entries are THEME keys, or literal colours that pass straight through.
-    bg, fg, hbg, hfg = (THEME.get(v, v) for v in _BTN_STYLES[kind])
-    b = tk.Button(parent, text=text, command=command, relief="flat", bd=0,
-                  cursor="hand2", highlightthickness=0, bg=bg, fg=fg,
-                  activebackground=hbg, activeforeground=hfg, **kw)
-    b.bind("<Enter>", lambda e: b.configure(bg=hbg, fg=hfg))
-    b.bind("<Leave>", lambda e: b.configure(bg=bg, fg=fg))
-    return b
+    return SurfaceButton(parent, text, command, kind=kind, **kw)
+
+
+class ToggleSwitch(tk.Canvas):
+    """An on/off switch: inset track, raised knob, short slide between them."""
+
+    W, H = 46, 26
+    DURATION = 0.13
+
+    def __init__(self, parent, variable, command=None, behind=None, **kw):
+        self.var = variable
+        self._command = command
+        self._behind = behind or THEME["surface"]
+        self._enabled = True
+        self._pos = 1.0 if variable.get() else 0.0
+        self._target = self._pos
+        self._t0 = None
+        self._photos = {}
+        super().__init__(parent, width=self.W, height=self.H, bd=0,
+                         highlightthickness=0, bg=self._behind, takefocus=0,
+                         cursor="hand2", **kw)
+        self._track = self.create_image(0, 0, anchor="nw")
+        self._knob = self.create_image(0, 0, anchor="nw")
+        self.bind("<Button-1>", self._clicked)
+        self._trace = variable.trace_add("write", lambda *_: self._sync())
+        self._draw()
+
+    def _photo(self, key, *args, **kwargs):
+        photo = self._photos.get(key)
+        if photo is None:
+            photo = ImageTk.PhotoImage(render_surface(*args, **kwargs))
+            self._photos[key] = photo
+        return photo
+
+    def _draw(self):
+        if not HAS_PIL:
+            self.configure(bg=THEME["accent"] if self.var.get() else THEME["surface_hi"])
+            return
+        on = THEME["accent"] if self._enabled else THEME["surface_hi"]
+        fill = lerp(THEME["well"], on, quantise(self._pos))
+        self.itemconfigure(self._track, image=self._photo(
+            ("track", fill), self.W, self.H, self.H // 2, fill, self._behind,
+            inset=True, strength=0.7))
+        d = self.H - 8
+        knob = THEME["text"] if self._enabled else THEME["text_faint"]
+        self.itemconfigure(self._knob, image=self._photo(
+            ("knob", knob), d, d, d // 2, knob, fill, strength=0.55))
+        self.coords(self._knob, 4 + int((self.W - d - 8) * self._pos), 4)
+
+    def _clicked(self, _):
+        if not self._enabled:
+            return
+        self.var.set(not self.var.get())
+        if self._command:
+            self._command()
+
+    def _sync(self):
+        self._target = 1.0 if self.var.get() else 0.0
+        if abs(self._target - self._pos) < 0.01:
+            return
+        self._t0 = time.perf_counter()
+        self._start = self._pos
+        self._animate()
+
+    def _animate(self):
+        if not self.winfo_exists():
+            return
+        t = (time.perf_counter() - self._t0) / self.DURATION
+        if t >= 1.0:
+            self._pos = self._target
+            self._draw()
+            return
+        self._pos = self._start + (self._target - self._start) * smoothstep(t)
+        self._draw()
+        self.after(FRAME_MS, self._animate)
+
+    def set_enabled(self, enabled):
+        self._enabled = bool(enabled)
+        self.configure(cursor="hand2" if enabled else "")
+        self._photos.clear()
+        self._draw()
 
 
 def entry_style():
@@ -1472,17 +1661,19 @@ def entry_style():
 class ScrollFrame(tk.Frame):
     """Vertically scrollable container. `body` is the frame to fill."""
 
-    def __init__(self, parent, height=250, **kw):
-        super().__init__(parent, bg=THEME["bg"], **kw)
-        self._cv = tk.Canvas(self, bg=THEME["bg"], highlightthickness=0, bd=0,
+    def __init__(self, parent, height=250, bg=None, **kw):
+        bg = bg or THEME["bg"]
+        self._bg = bg
+        super().__init__(parent, bg=bg, **kw)
+        self._cv = tk.Canvas(self, bg=bg, highlightthickness=0, bd=0,
                              height=height, takefocus=0)
         self._sb = tk.Scrollbar(self, orient="vertical", command=self._cv.yview,
                                 relief="flat", bd=0, width=10,
-                                bg=THEME["surface"], troughcolor=THEME["bg"],
+                                bg=THEME["surface"], troughcolor=bg,
                                 activebackground=THEME["surface_hi"])
         self._cv.configure(yscrollcommand=self._on_scroll)
         self._cv.pack(side="left", fill="both", expand=True)
-        self.body = tk.Frame(self._cv, bg=THEME["bg"])
+        self.body = tk.Frame(self._cv, bg=bg)
         self._win = self._cv.create_window(0, 0, anchor="nw", window=self.body)
         self.body.bind("<Configure>", self._resize)
         self._cv.bind("<Configure>",
@@ -1816,12 +2007,107 @@ def apply_window_icon(win):
 #  Now lists the clocks it manages: without this there was no way to reach a
 #  clock that had drifted off-screen, or to see what you owned.
 # ---------------------------------------------------------------------------
+MGR_W = 396          # inner content width
+ROW_H = 42
+
+
+class ClockRow(tk.Canvas):
+    """One clock in the manager list: a raised surface striped in its colour.
+
+    The controls are tagged canvas items rather than child widgets - the same
+    approach ClockWindow uses for its own chrome - so a long list does not carry
+    three extra widgets per row.  Everything re-lays out on <Configure>, which
+    matters when the scrollbar appears and narrows the list.
+    """
+
+    def __init__(self, parent, win, app, width):
+        self.win = win
+        self.app = app
+        self._cw = width
+        self._images = {}          # strong refs, or the row paints blank
+        self._accent = win.cfg.get("text_color", "#ffffff")
+        super().__init__(parent, width=width, height=ROW_H, bd=0,
+                         highlightthickness=0, bg=THEME["well"], takefocus=0)
+
+        self._bg = self.create_image(0, 0, anchor="nw") if HAS_PIL else None
+        if not HAS_PIL:
+            self.configure(bg=THEME["surface"])
+        self._stripe = self.create_rectangle(0, 8, 3, ROW_H - 8,
+                                             fill=self._accent, outline="")
+        self.create_text(16, ROW_H // 2, anchor="w",
+                         text=win.cfg.get("label", ""), fill=THEME["text"],
+                         font=ui_font(10, "bold"))
+
+        self._buttons = []
+        for label, cmd, hover, font in (
+                ("✕", lambda: app.remove_clock(win), THEME["danger"], ui_font(11)),
+                ("Find", lambda: app.recall(win), THEME["text"], ui_font(9)),
+                ("✎", lambda: app.edit_clock(win), self._accent, ui_font(11)),
+        ):
+            tag = f"b{len(self._buttons)}"
+            item = self.create_text(0, ROW_H // 2, anchor="e", text=label,
+                                    fill=THEME["text_faint"], font=font,
+                                    tags=(tag,))
+            self.tag_bind(tag, "<Button-1>", lambda e, c=cmd: c())
+            self.tag_bind(tag, "<Enter>", lambda e, t=tag, c=hover: (
+                self.itemconfigure(t, fill=c), self.configure(cursor="hand2")))
+            self.tag_bind(tag, "<Leave>", lambda e, t=tag: (
+                self.itemconfigure(t, fill=THEME["text_faint"]),
+                self.configure(cursor="")))
+            self._buttons.append(item)
+
+        self._clock = self.create_text(0, ROW_H // 2, anchor="e", text="",
+                                       fill=THEME["text_dim"], font=ui_font(10))
+        self.bind("<Enter>", lambda e: self._paint(True))
+        self.bind("<Leave>", lambda e: self._paint(False))
+        self.bind("<Configure>", self._on_configure)
+        self._layout()
+        self._paint(False)
+
+    def _layout(self):
+        x = self._cw - 14
+        for item in self._buttons:
+            self.coords(item, x, ROW_H // 2)
+            box = self.bbox(item)
+            x -= (box[2] - box[0]) + 14
+        self.coords(self._clock, x - 4, ROW_H // 2)
+
+    def _paint(self, hover):
+        if self._bg is None:
+            self.configure(bg=THEME["surface_hi"] if hover else THEME["surface"])
+            return
+        key = (hover, self._cw)
+        photo = self._images.get(key)
+        if photo is None:
+            photo = ImageTk.PhotoImage(render_surface(
+                self._cw, ROW_H, 8,
+                THEME["surface_hi"] if hover else THEME["surface"],
+                THEME["well"], strength=0.6))
+            self._images[key] = photo
+        self.itemconfigure(self._bg, image=photo)
+
+    def _on_configure(self, e):
+        if e.width == self._cw:
+            return
+        self._cw = e.width
+        self._layout()
+        self._paint(False)
+
+    def tick(self):
+        now = datetime.datetime.now(self.win.zone())
+        fmt = "%H:%M:%S" if self.win.cfg.get("hour24", True) else "%I:%M:%S %p"
+        self.itemconfigure(self._clock, text=now.strftime(fmt))
+
+
+
 class ManagerWindow(tk.Toplevel):
+    """The manager, drawn with the same surfaces as the clocks it manages."""
 
     def __init__(self, master, app):
         super().__init__(master)
         self.app = app
         self._rows = []
+        self._photos = {}          # strong refs for hero / row images
         self.title(APP_NAME)
         self.configure(bg=THEME["bg"])
         self.resizable(False, False)
@@ -1841,66 +2127,82 @@ class ManagerWindow(tk.Toplevel):
         self.lift()
         self.focus_force()
 
+    # -- construction ------------------------------------------------------
     def _build(self):
-        head = tk.Frame(self, bg=THEME["bg"], pady=22, padx=30)
-        head.pack(fill="x")
-        if HAS_PIL:
-            self._mark = ImageTk.PhotoImage(make_app_icon(46))
-            tk.Label(head, image=self._mark, bg=THEME["bg"]).pack()
-        tk.Label(head, text="Solari", bg=THEME["bg"], fg=THEME["text"],
-                 font=ui_font(21, "bold")).pack(pady=(9, 2))
-        tk.Label(head, text="Floating flip-clock widgets for your desktop",
-                 bg=THEME["bg"], fg=THEME["text_faint"],
-                 font=ui_font(10)).pack()
+        pad = 22
+        outer = tk.Frame(self, bg=THEME["bg"], padx=pad, pady=pad)
+        outer.pack(fill="both", expand=True)
+        inner = MGR_W - pad * 2
 
-        tk.Frame(self, bg=THEME["divider"], height=1).pack(fill="x")
+        self._build_hero(outer, inner)
 
-        cap = tk.Frame(self, bg=THEME["bg"], padx=24, pady=8)
-        cap.pack(fill="x")
+        cap = tk.Frame(outer, bg=THEME["bg"])
+        cap.pack(fill="x", pady=(18, 6))
         tk.Label(cap, text="CLOCKS", bg=THEME["bg"], fg=THEME["text_faint"],
                  font=ui_font(9, "bold")).pack(side="left")
         self._count = tk.Label(cap, text="", bg=THEME["bg"],
                                fg=THEME["text_faint"], font=ui_font(9))
         self._count.pack(side="right")
 
-        self.list = ScrollFrame(self, height=176)
-        self.list.pack(fill="x", padx=24)
+        # The list sits in the well colour, so rows read as recessed into it.
+        self.list = ScrollFrame(outer, height=(ROW_H + 4) * 4 + 4, bg=THEME["well"])
+        self.list.pack(fill="x")
+        self._row_w = inner
 
-        body = tk.Frame(self, bg=THEME["bg"], padx=24, pady=12)
-        body.pack(fill="x")
+        body = tk.Frame(outer, bg=THEME["bg"])
+        body.pack(fill="x", pady=(14, 0))
         make_button(body, "＋   Add Clock", self.app.add_clock, kind="primary",
-                    font=ui_font(12, "bold"), pady=11).pack(fill="x", pady=(0, 8))
+                    font=ui_font(12, "bold"), pady=11).pack(fill="x")
         make_button(body, "Bring all on screen", self.app.recall_all,
-                    kind="ghost", font=ui_font(10), pady=7).pack(fill="x")
+                    kind="ghost", font=ui_font(10), pady=8).pack(fill="x", pady=(8, 0))
 
         st = tk.Frame(body, bg=THEME["surface"])
-        st.pack(fill="x", pady=(10, 8))
-        tk.Label(st, text="  Launch at Windows startup", bg=THEME["surface"],
+        st.pack(fill="x", pady=(12, 8))
+        tk.Label(st, text="   Launch at Windows startup", bg=THEME["surface"],
                  fg=THEME["text_dim"] if HAS_WINREG else THEME["text_faint"],
-                 font=ui_font(10)).pack(side="left", pady=8)
-        cb = tk.Checkbutton(st, variable=self.app.startup_var,
-                            command=self.app.toggle_startup,
-                            bg=THEME["surface"], selectcolor=THEME["accent"],
-                            activebackground=THEME["surface"], relief="flat",
-                            cursor="hand2", highlightthickness=0)
-        cb.pack(side="right", padx=10)
+                 font=ui_font(10)).pack(side="left", pady=9)
+        self._startup = ToggleSwitch(st, self.app.startup_var,
+                                     command=self.app.toggle_startup,
+                                     behind=THEME["surface"])
+        self._startup.pack(side="right", padx=9)
         if not HAS_WINREG:
-            cb.configure(state="disabled", cursor="")
+            self._startup.set_enabled(False)
 
         make_button(body, "Quit", self.app.quit_app, kind="danger",
                     font=ui_font(10), pady=8).pack(fill="x")
 
-        tk.Frame(self, bg=THEME["divider"], height=1).pack(fill="x")
-        foot = tk.Frame(self, bg=THEME["bg"], pady=10)
-        foot.pack(fill="x")
+        foot = tk.Frame(outer, bg=THEME["bg"])
+        foot.pack(fill="x", pady=(16, 0))
+        tk.Frame(foot, bg=THEME["divider"], height=1).pack(fill="x", pady=(0, 10))
         tk.Label(foot, text=pretty_path(config_dir()), bg=THEME["bg"],
-                 fg=THEME["text_faint"],
-                 font=ui_font(8)).pack()
+                 fg=THEME["text_faint"], font=ui_font(8)).pack()
         tk.Label(foot, text="by  Cervezagua", bg=THEME["bg"],
-                 fg=THEME["text_faint"], font=ui_font(9, "italic")).pack(pady=(4, 0))
+                 fg=THEME["text_faint"], font=ui_font(9, "italic")).pack(pady=(3, 0))
 
-        self.minsize(392, 0)
+        self.minsize(MGR_W, 0)
         self.update_idletasks()
+
+    def _build_hero(self, parent, width):
+        """The banner: one rendered panel, with the mark and titles on top."""
+        h = 92
+        cv = tk.Canvas(parent, width=width, height=h, bd=0, highlightthickness=0,
+                       bg=THEME["bg"], takefocus=0)
+        cv.pack(fill="x")
+        if HAS_PIL:
+            self._photos["hero"] = ImageTk.PhotoImage(render_surface(
+                width, h, 12, THEME["surface"], THEME["bg"], strength=0.75))
+            cv.create_image(0, 0, anchor="nw", image=self._photos["hero"])
+            self._photos["mark"] = ImageTk.PhotoImage(make_app_icon(44))
+            cv.create_image(24, h // 2, anchor="w", image=self._photos["mark"])
+            tx = 84
+        else:
+            cv.configure(bg=THEME["surface"])
+            tx = 24
+        cv.create_text(tx, h // 2 - 11, anchor="w", text="Solari",
+                       fill=THEME["text"], font=ui_font(20, "bold"))
+        cv.create_text(tx, h // 2 + 13, anchor="w",
+                       text="Floating flip-clock widgets",
+                       fill=THEME["text_faint"], font=ui_font(10))
 
     # -- clock list --------------------------------------------------------
     def refresh_list(self):
@@ -1914,38 +2216,15 @@ class ManagerWindow(tk.Toplevel):
         self.on_second(time.time())
 
     def _make_row(self, win):
-        tc = win.cfg.get("text_color", "#ffffff")
-        row = tk.Frame(self.list.body, bg=THEME["surface"])
+        row = ClockRow(self.list.body, win, self.app, self._row_w)
         row.pack(fill="x", pady=2)
-
-        tk.Label(row, text="●", bg=THEME["surface"], fg=tc,
-                 font=ui_font(9)).pack(side="left", padx=(10, 4))
-        tk.Label(row, text=win.cfg.get("label", ""), bg=THEME["surface"],
-                 fg=THEME["text"], font=ui_font(10, "bold"), anchor="w"
-                 ).pack(side="left")
-
-        make_button(row, "✕", lambda w=win: self.app.remove_clock(w),
-                    kind="danger", font=ui_font(10), padx=8, pady=4
-                    ).pack(side="right", padx=(2, 8))
-        make_button(row, "Find", lambda w=win: self.app.recall(w),
-                    kind="ghost", font=ui_font(9), padx=8, pady=4
-                    ).pack(side="right", padx=2)
-        make_button(row, "✎", lambda w=win: self.app.edit_clock(w),
-                    kind="ghost", font=ui_font(10), padx=8, pady=4
-                    ).pack(side="right", padx=2)
-
-        clock = tk.Label(row, text="", bg=THEME["surface"], fg=THEME["text_dim"],
-                         font=ui_font(10))
-        clock.pack(side="right", padx=8)
-        return (win, clock)
+        return row
 
     def on_second(self, _ts):
         """Live preview in each row - the Manager rides the same shared tick."""
-        for win, lbl in self._rows:
+        for row in self._rows:
             try:
-                now = datetime.datetime.now(win.zone())
-                fmt = "%H:%M:%S" if win.cfg.get("hour24", True) else "%I:%M:%S %p"
-                lbl.configure(text=now.strftime(fmt))
+                row.tick()
             except tk.TclError:
                 pass
 

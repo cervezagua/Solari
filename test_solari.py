@@ -12,6 +12,7 @@ import json
 import os
 import tempfile
 import time
+import types
 import tkinter as tk
 import unittest
 import zoneinfo
@@ -282,6 +283,46 @@ class PathDisplay(unittest.TestCase):
 @unittest.skipUnless(S.HAS_PIL, "Pillow not installed")
 class Rendering(unittest.TestCase):
 
+    def test_surface_size_and_mode(self):
+        img = S.render_surface(140, 48, 10, S.THEME["surface"], S.THEME["bg"])
+        self.assertEqual(img.size, (140, 48))
+        self.assertEqual(img.mode, "RGB")
+
+    def test_raised_surface_is_lit_from_above(self):
+        img = S.render_surface(120, 60, 10, "#2a2a30", S.THEME["bg"])
+        self.assertGreater(sum(img.getpixel((60, 3))), sum(img.getpixel((60, 56))))
+
+    def test_inset_surface_inverts_the_lighting(self):
+        """A recess is shadowed at the top and catches light on its bottom lip -
+        the opposite of a raised surface, from the same function."""
+        img = S.render_surface(120, 60, 10, "#2a2a30", S.THEME["bg"], inset=True)
+        self.assertLess(sum(img.getpixel((60, 3))), sum(img.getpixel((60, 56))))
+
+    def test_strength_softens_the_shading(self):
+        full = S.render_surface(120, 60, 10, "#2a2a30", S.THEME["bg"], strength=1.0)
+        soft = S.render_surface(120, 60, 10, "#2a2a30", S.THEME["bg"], strength=0.3)
+        spread = lambda im: sum(im.getpixel((60, 3))) - sum(im.getpixel((60, 56)))
+        self.assertGreater(spread(full), spread(soft))
+
+    def test_surface_corners_blend_to_the_colour_behind(self):
+        behind = S.THEME["bg"]
+        img = S.render_surface(120, 60, 12, "#2a2a30", behind)
+        self.assertEqual(img.getpixel((0, 0)), S.to_rgb(behind))
+
+    def test_surface_is_cached(self):
+        args = (111, 41, 8, "#334455", S.THEME["bg"])
+        S.render_surface(*args)
+        before = S.render_surface.cache_info().hits
+        S.render_surface(*args)
+        self.assertEqual(S.render_surface.cache_info().hits, before + 1)
+
+    def test_cards_and_buttons_share_one_renderer(self):
+        """render_card must delegate, so the two can never drift apart."""
+        behind = S.THEME["well"]
+        card = S.render_card(82, 104, 12, "#1e1e1e", None, behind, False)
+        surface = S.render_surface(82, 104, 12, "#1e1e1e", behind)
+        self.assertEqual(list(card.getdata()), list(surface.getdata()))
+
     def test_card_has_requested_size_and_is_opaque(self):
         img = S.render_card(82, 104, 12, "#1e1e1e", None, S.THEME["well"], False)
         self.assertEqual(img.size, (82, 104))
@@ -393,6 +434,172 @@ class FlipCardBehaviour(unittest.TestCase):
         ya = self.card.coords(self.card._txt_a)[1]
         yb = self.card.coords(self.card._txt_b)[1]
         self.assertLess(ya, yb, "outgoing digit should ride above the incoming one")
+
+
+@needs_display
+class RenderedWidgets(unittest.TestCase):
+    """SurfaceButton / ToggleSwitch: the chrome shared with the manager."""
+
+    def setUp(self):
+        # Mapped, not withdrawn: an unmapped widget reports width 1 and does not
+        # dispatch synthetic events, so click tests would pass vacuously.
+        self.root = tk.Tk()
+        self.root.geometry("340x220+40+40")
+        S.resolve_fonts(self.root)
+        self.root.update()
+        self.fired = []
+
+    def tearDown(self):
+        self.root.destroy()
+
+    def _button(self, **kw):
+        b = S.make_button(self.root, "Press", lambda: self.fired.append(1), **kw)
+        b.pack()
+        self.root.update()
+        return b
+
+    def test_button_does_not_shadow_tk_internals(self):
+        """tkinter.Misc keeps the widget's Tcl path in _w; shadowing it makes
+        every later call address a widget that does not exist."""
+        b = self._button()
+        self.assertIsInstance(b._w, str)
+        self.assertTrue(b._w.startswith("."))
+
+    def test_click_fires_the_command(self):
+        b = self._button()
+        b.event_generate("<ButtonPress-1>", x=5, y=5)
+        b.event_generate("<ButtonRelease-1>", x=5, y=5)
+        self.root.update()
+        self.assertEqual(self.fired, [1])
+
+    def test_release_outside_does_not_fire(self):
+        b = self._button()
+        b.event_generate("<ButtonPress-1>", x=5, y=5)
+        b.event_generate("<ButtonRelease-1>", x=-50, y=-50)
+        self.root.update()
+        self.assertEqual(self.fired, [])
+
+    def test_disabled_button_does_not_fire(self):
+        b = self._button()
+        b.set_enabled(False)
+        b.event_generate("<ButtonPress-1>", x=5, y=5)
+        b.event_generate("<ButtonRelease-1>", x=5, y=5)
+        self.root.update()
+        self.assertEqual(self.fired, [])
+
+    def test_button_repaints_when_stretched(self):
+        b = S.make_button(self.root, "Wide", lambda: None)
+        natural = b._cw
+        b.pack(fill="x")
+        self.root.update()
+        self.assertGreater(b.winfo_width(), natural,
+                           "fill='x' should have stretched the button")
+        self.assertEqual(b._cw, b.winfo_width(),
+                         "button did not re-render at its new width")
+
+    def test_toggle_follows_its_variable(self):
+        var = tk.BooleanVar(value=False)
+        sw = S.ToggleSwitch(self.root, var)
+        sw.pack()
+        self.root.update()
+        self.assertEqual(sw._pos, 0.0)
+        var.set(True)
+        for _ in range(40):
+            self.root.update()
+            time.sleep(0.006)
+        self.assertEqual(sw._pos, 1.0)
+
+    def test_toggle_click_flips_the_variable(self):
+        var = tk.BooleanVar(value=False)
+        sw = S.ToggleSwitch(self.root, var)
+        sw.pack()
+        self.root.update()
+        sw.event_generate("<Button-1>", x=10, y=10)
+        self.root.update()
+        self.assertTrue(var.get())
+
+    def test_disabled_toggle_ignores_clicks(self):
+        var = tk.BooleanVar(value=False)
+        sw = S.ToggleSwitch(self.root, var)
+        sw.pack()
+        sw.set_enabled(False)
+        self.root.update()
+        sw.event_generate("<Button-1>", x=10, y=10)
+        self.root.update()
+        self.assertFalse(var.get())
+
+
+@needs_display
+class ManagerBehaviour(unittest.TestCase):
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self._orig = S.config_dir
+        S.config_dir = lambda: self.dir
+        self.root = tk.Tk()
+        self.root.withdraw()
+        S.resolve_fonts(self.root)
+
+    def tearDown(self):
+        S.config_dir = self._orig
+        self.root.destroy()
+
+    def _manager(self, n):
+        app = types.SimpleNamespace(
+            windows=[], startup_var=tk.BooleanVar(value=False),
+            toggle_startup=lambda: None, add_clock=lambda: None,
+            recall_all=lambda: None, quit_app=lambda: None,
+            remove_clock=lambda w: None, recall=lambda w: None,
+            edit_clock=lambda w: None, tray_active=lambda: False)
+        ticker = S.Ticker(self.root)
+        for i in range(n):
+            cfg = S.migrate_clock({"tz": "UTC", "label": f"Zone {i}",
+                                   "text_color": S.COLOR_CYCLE[i % 6]})
+            app.windows.append(S.ClockWindow(self.root, cfg, ticker,
+                                             lambda w: None, lambda w: None,
+                                             lambda: []))
+        mgr = S.ManagerWindow(self.root, app)
+        mgr.refresh_list()
+        self.root.update()
+        return mgr
+
+    def test_builds_a_row_per_clock(self):
+        for n in (1, 3, 6):
+            mgr = self._manager(n)
+            self.assertEqual(len(mgr._rows), n)
+            self.assertIn(str(n), mgr._count.cget("text"))
+            mgr.destroy()
+
+    def test_count_label_is_singular_for_one(self):
+        mgr = self._manager(1)
+        self.assertEqual(mgr._count.cget("text"), "1 clock")
+
+    def test_row_controls_stay_inside_the_row(self):
+        """The rightmost control must not run off the edge, including when the
+        scrollbar appears and narrows every row."""
+        mgr = self._manager(7)
+        for row in mgr._rows:
+            self.assertLessEqual(row.bbox(row._buttons[0])[2], row._cw)
+
+    def test_rows_carry_their_clock_colour(self):
+        mgr = self._manager(3)
+        for row in mgr._rows:
+            self.assertEqual(row.itemcget(row._stripe, "fill"),
+                             row.win.cfg["text_color"])
+
+    def test_tick_fills_in_every_row_time(self):
+        mgr = self._manager(3)
+        mgr.on_second(time.time())
+        for row in mgr._rows:
+            self.assertRegex(row.itemcget(row._clock, "text"),
+                             r"^\d{2}:\d{2}:\d{2}")
+
+    def test_twelve_hour_row_shows_the_meridiem(self):
+        mgr = self._manager(1)
+        mgr._rows[0].win.cfg["hour24"] = False
+        mgr.on_second(time.time())
+        self.assertRegex(mgr._rows[0].itemcget(mgr._rows[0]._clock, "text"),
+                         r"(AM|PM)$")
 
 
 @needs_display
