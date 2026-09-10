@@ -791,7 +791,11 @@ class FlipCard(tk.Canvas):
         self._cur = self._nxt = digit
         self._rolling = False
         self._set_face(False)
-        self.itemconfigure(self._txt_a, text=digit, fill=self.text_color)
+        # state="normal" is required, not cosmetic: step() hides this item once
+        # the outgoing digit has faded, so landing a roll without restoring it
+        # leaves both items hidden and the card blank.
+        self.itemconfigure(self._txt_a, text=digit, fill=self.text_color,
+                           state="normal")
         self.coords(self._txt_a, self.W // 2, self.H // 2)
         self.itemconfigure(self._txt_b, state="hidden")
 

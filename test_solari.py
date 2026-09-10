@@ -7,13 +7,56 @@ app (see README).
 """
 
 import datetime
+import functools
 import json
 import os
 import tempfile
+import time
+import tkinter as tk
 import unittest
 import zoneinfo
 
 import solari as S
+
+
+@functools.lru_cache(maxsize=1)
+def _display_available():
+    """GUI tests need a real display; the rest of this file does not."""
+    try:
+        root = tk.Tk()
+        root.destroy()
+        return True
+    except Exception:
+        return False
+
+
+needs_display = unittest.skipUnless(_display_available(), "no display available")
+
+
+def shown_digit(card):
+    """The digit a FlipCard is actually displaying, or None if it is blank."""
+    for item in (card._txt_a, card._txt_b):
+        if (card.itemcget(item, "state") or "normal") != "hidden":
+            return card.itemcget(item, "text")
+    return None
+
+
+def settle(card):
+    """Run a roll to completion through real intermediate frames.
+
+    It has to walk the frames rather than jumping to the end: the outgoing text
+    item is hidden partway through, and skipping straight to the completion
+    branch would never exercise that - which is precisely the state the blank
+    card bug lived in.
+    """
+    if not card._rolling:
+        return
+    step_s = S.FRAME_MS / 1000.0
+    i = 0
+    while card.step(card._t0 + i * step_s):
+        i += 1
+        if i > 500:
+            raise AssertionError("roll never terminated")
 
 
 class ColourMaths(unittest.TestCase):
@@ -274,6 +317,140 @@ class Rendering(unittest.TestCase):
 
     def test_app_icon(self):
         self.assertEqual(S.make_app_icon(64).size, (64, 64))
+
+
+@needs_display
+class FlipCardBehaviour(unittest.TestCase):
+    """Regression cover for the animation's visible state.
+
+    Asserting the digit's *text* is not enough: step() hides the outgoing text
+    item once it has faded, so a completed roll that never restores it leaves
+    the card blank while still reporting the right text.
+    """
+
+    def setUp(self):
+        self.root = tk.Tk()
+        self.root.withdraw()
+        S.resolve_fonts(self.root)
+        self.ticker = S.Ticker(self.root)
+        self.card = S.FlipCard(self.root, self.ticker, "#ffffff", "#1e1e1e", 1.0)
+        self.card.pack()
+        self.root.update()
+
+    def tearDown(self):
+        self.ticker.stop()
+        self.root.destroy()
+
+    def test_digit_is_visible_before_any_roll(self):
+        self.card.set_immediate("3")
+        self.assertEqual(shown_digit(self.card), "3")
+
+    def test_digit_is_still_visible_after_a_completed_roll(self):
+        self.card.set_immediate("3")
+        self.card.set("7")
+        settle(self.card)
+        self.assertEqual(shown_digit(self.card), "7",
+                         "card went blank after the roll landed")
+
+    def test_card_never_blanks_across_many_consecutive_rolls(self):
+        self.card.set_immediate("0")
+        for i in range(1, 13):
+            d = str(i % 10)
+            self.card.set(d)
+            settle(self.card)
+            self.assertEqual(shown_digit(self.card), d, f"blank after roll {i}")
+
+    def test_exactly_one_item_is_visible_at_rest(self):
+        self.card.set_immediate("5")
+        self.card.set("6")
+        settle(self.card)
+        states = [(self.card.itemcget(i, "state") or "normal")
+                  for i in (self.card._txt_a, self.card._txt_b)]
+        self.assertEqual(states.count("hidden"), 1,
+                         "at rest exactly one digit item should be showing")
+
+    def test_mid_roll_shows_both_digits_clipped_apart(self):
+        self.card.set_immediate("3")
+        self.card.set("7")
+        self.card.step(self.card._t0 + S.DRUM_DURATION * 0.5)
+        ya = self.card.coords(self.card._txt_a)[1]
+        yb = self.card.coords(self.card._txt_b)[1]
+        self.assertLess(ya, yb, "outgoing digit should ride above the incoming one")
+
+
+@needs_display
+class ClockWindowBehaviour(unittest.TestCase):
+
+    def setUp(self):
+        self.root = tk.Tk()
+        self.root.withdraw()
+        S.resolve_fonts(self.root)
+        self.ticker = S.Ticker(self.root)
+        self.cfg = S.migrate_clock({"tz": "UTC", "label": "Test"})
+        self.win = S.ClockWindow(self.root, self.cfg, self.ticker,
+                                 lambda w: None, lambda w: None, lambda: [])
+        self.root.update()
+
+    def tearDown(self):
+        self.ticker.stop()
+        self.root.destroy()
+
+    def _settle_all(self):
+        for card in self.win._cards.values():
+            if card._rolling:
+                settle(card)
+
+    def test_every_digit_is_visible_on_first_paint(self):
+        for key, card in self.win._cards.items():
+            self.assertIsNotNone(shown_digit(card), f"{key} blank on first paint")
+
+    def test_every_digit_stays_visible_across_simulated_seconds(self):
+        """The reported bug: minutes and seconds blanked out as they rolled."""
+        base = datetime.datetime(2026, 1, 1, 11, 58, 55)
+        for offset in range(12):
+            fake = base + datetime.timedelta(seconds=offset)
+            self.win._last.clear()
+            hh, mm, ss = fake.strftime("%H"), fake.strftime("%M"), fake.strftime("%S")
+            digits = {"h1": hh[0], "h2": hh[1], "m1": mm[0], "m2": mm[1],
+                      "s1": ss[0], "s2": ss[1]}
+            for key, card in self.win._cards.items():
+                card.set(digits[key])
+            self._settle_all()
+            for key, card in self.win._cards.items():
+                self.assertEqual(shown_digit(card), digits[key],
+                                 f"{key} wrong/blank at {fake:%H:%M:%S}")
+
+    def test_both_digits_of_each_pair_render(self):
+        self.win.on_second(time.time(), animate=True)
+        self._settle_all()
+        for pair in (("h1", "h2"), ("m1", "m2"), ("s1", "s2")):
+            for key in pair:
+                self.assertIsNotNone(shown_digit(self.win._cards[key]),
+                                     f"{key} of pair {pair} is blank")
+
+    def test_hiding_seconds_drops_to_four_cards(self):
+        self.cfg["show_seconds"] = False
+        self.win.refresh_style()
+        self.assertEqual(len(self.win._cards), 4)
+        for key, card in self.win._cards.items():
+            self.assertIsNotNone(shown_digit(card), f"{key} blank after relayout")
+
+    def test_twelve_hour_mode_keeps_two_hour_digits(self):
+        self.cfg["hour24"] = False
+        self.win.refresh_style()
+        self.win.on_second(time.time(), animate=False)
+        for key in ("h1", "h2"):
+            self.assertIsNotNone(shown_digit(self.win._cards[key]))
+
+    def test_digits_survive_a_rescale(self):
+        self.win.on_second(time.time(), animate=True)
+        self._settle_all()
+        for scale in (0.4, 1.0, 2.5):
+            self.win._scale = scale
+            self.win._relayout()
+            for key, card in self.win._cards.items():
+                self.assertIsNotNone(shown_digit(card),
+                                     f"{key} blank at scale {scale}")
 
 
 if __name__ == "__main__":

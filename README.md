@@ -89,9 +89,13 @@ The edit dialog has a searchable list of all available timezones.
 python -m unittest test_solari -v
 ```
 
-Runs headless — no display required. Covers the colour maths, config
-load/migrate/save (including recovery from a corrupt or partly-invalid file),
-off-screen clamping, UTC-offset and day-badge formatting, and the card renderer.
+Covers the colour maths, config load/migrate/save (including recovery from a
+corrupt or partly-invalid file), off-screen clamping, UTC-offset and day-badge
+formatting, and the card renderer — all without a display.
+
+A second group drives the widgets themselves (the flip animation's visible
+state, relayout, rescale) and is skipped automatically when no display is
+available, so the same command works on a build agent and on your desktop.
 
 ---
 

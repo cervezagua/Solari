@@ -1,4 +1,5 @@
 @echo off
+setlocal
 title Solari - Build Script
 echo.
 echo  ========================================
@@ -6,31 +7,51 @@ echo    Solari - Flip-Clock Widget Builder
 echo  ========================================
 echo.
 
-python --version >nul 2>&1
+REM --- Locate a Python interpreter -----------------------------------------
+set "PY=python"
+%PY% --version >nul 2>&1
 if errorlevel 1 (
-    echo  [ERROR] Python not found. Install Python 3.10+ from python.org
-    pause & exit /b 1
+    set "PY=py -3"
+    py -3 --version >nul 2>&1
+    if errorlevel 1 (
+        echo  [ERROR] Python not found. Install Python 3.10+ from python.org
+        echo          and tick "Add python.exe to PATH" in the installer.
+        pause & exit /b 1
+    )
 )
+for /f "delims=" %%V in ('%PY% --version 2^>^&1') do echo  Using %%V
+echo.
 
 echo  Closing Solari if running...
 taskkill /f /im Solari.exe >nul 2>&1
+
 echo.
 echo  [1/4] Checking PyInstaller...
-pip show pyinstaller >nul 2>&1 || pip install pyinstaller
+%PY% -m PyInstaller --version >nul 2>&1 || %PY% -m pip install --upgrade pyinstaller
+%PY% -m PyInstaller --version >nul 2>&1
+if errorlevel 1 (
+    echo  [ERROR] PyInstaller could not be installed or run.
+    echo          Try manually:  %PY% -m pip install --upgrade pyinstaller
+    pause & exit /b 1
+)
 
 echo  [2/4] Checking tzdata...
-pip show tzdata >nul 2>&1 || pip install tzdata
+%PY% -c "import tzdata" >nul 2>&1 || %PY% -m pip install tzdata
 
 echo  [3/4] Checking Pillow (card rendering) + pystray (tray icon)...
-pip show Pillow  >nul 2>&1 || pip install Pillow
-pip show pystray >nul 2>&1 || pip install pystray
+%PY% -c "import PIL" >nul 2>&1 || %PY% -m pip install Pillow
+%PY% -c "import pystray" >nul 2>&1 || %PY% -m pip install pystray
 
 echo  [4/4] Building EXE...
 echo.
 
-pyinstaller ^
+REM Invoked as a module, not as pyinstaller.exe: right after a fresh install
+REM the Scripts directory is often not on PATH yet, and the bare command fails.
+%PY% -m PyInstaller ^
   --onefile ^
   --windowed ^
+  --noconfirm ^
+  --clean ^
   --name "Solari" ^
   --icon "solari.ico" ^
   --hidden-import zoneinfo ^
@@ -41,7 +62,6 @@ pyinstaller ^
   --hidden-import PIL.ImageDraw ^
   --hidden-import PIL.ImageFilter ^
   --hidden-import PIL.ImageTk ^
-  --add-data "solari.ico;." ^
   --collect-all tzdata ^
   --collect-all pystray ^
   --exclude-module numpy ^
@@ -51,23 +71,24 @@ pyinstaller ^
   --exclude-module IPython ^
   --exclude-module notebook ^
   --exclude-module docutils ^
-  --exclude-module setuptools ^
-  --exclude-module pkg_resources ^
-  --exclude-module xml ^
-  --exclude-module xmlrpc ^
+  --exclude-module pytest ^
   --exclude-module unittest ^
-  --exclude-module http ^
-  --exclude-module email ^
-  --exclude-module html ^
+  --exclude-module xmlrpc ^
   --exclude-module ftplib ^
   --exclude-module imaplib ^
   --exclude-module poplib ^
   --exclude-module smtplib ^
-  --exclude-module telnetlib ^
-  --exclude-module urllib ^
   solari.py
 
+set "RC=%ERRORLEVEL%"
 echo.
+if not "%RC%"=="0" (
+    echo  [ERROR] PyInstaller exited with code %RC%.
+    echo          The real cause is in the output above - look for the last
+    echo          line starting with "ERROR:" or a Python traceback.
+    pause & exit /b %RC%
+)
+
 if exist "dist\Solari.exe" (
     echo  =========================================
     echo    SUCCESS!  dist\Solari.exe is ready
@@ -80,9 +101,9 @@ if exist "dist\Solari.exe" (
     echo  Optional - further ~40%% compression with UPX:
     echo    1. Download upx.exe from github.com/upx/upx/releases
     echo    2. Place upx.exe in this folder
-    echo    3. Add  --upx-dir .  to the pyinstaller command above
+    echo    3. Add  --upx-dir .  to the PyInstaller command above
     echo.
 ) else (
-    echo  [ERROR] Build failed. Check output above.
+    echo  [ERROR] PyInstaller reported success but dist\Solari.exe is missing.
 )
 pause
