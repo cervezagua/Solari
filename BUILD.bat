@@ -1,5 +1,6 @@
 @echo off
 setlocal
+REM Set SOLARI_CI=1 to run unattended (CI): skips every pause.
 title Solari - Build Script
 echo.
 echo  ========================================
@@ -16,7 +17,8 @@ if errorlevel 1 (
     if errorlevel 1 (
         echo  [ERROR] Python not found. Install Python 3.10+ from python.org
         echo          and tick "Add python.exe to PATH" in the installer.
-        pause & exit /b 1
+        if not "%SOLARI_CI%"=="1" pause
+        exit /b 1
     )
 )
 for /f "delims=" %%V in ('%PY% --version 2^>^&1') do echo  Using %%V
@@ -32,7 +34,8 @@ echo  [1/4] Checking PyInstaller...
 if errorlevel 1 (
     echo  [ERROR] PyInstaller could not be installed or run.
     echo          Try manually:  %PY% -m pip install --upgrade pyinstaller
-    pause & exit /b 1
+    if not "%SOLARI_CI%"=="1" pause
+    exit /b 1
 )
 
 echo  [2/4] Checking tzdata...
@@ -86,7 +89,8 @@ if not "%RC%"=="0" (
     echo  [ERROR] PyInstaller exited with code %RC%.
     echo          The real cause is in the output above - look for the last
     echo          line starting with "ERROR:" or a Python traceback.
-    pause & exit /b %RC%
+    if not "%SOLARI_CI%"=="1" pause
+    exit /b %RC%
 )
 
 if exist "dist\Solari.exe" (
@@ -105,5 +109,7 @@ if exist "dist\Solari.exe" (
     echo.
 ) else (
     echo  [ERROR] PyInstaller reported success but dist\Solari.exe is missing.
+    if not "%SOLARI_CI%"=="1" pause
+    exit /b 1
 )
-pause
+if not "%SOLARI_CI%"=="1" pause

@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Tests (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The system interpreter is used deliberately: setup-python's Linux
+      # builds do not reliably ship _tkinter, and every test imports solari,
+      # which imports tkinter at module scope.
+      - name: Install Tk, Xvfb and dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk xvfb
+          python3 -m pip install --break-system-packages --upgrade Pillow tzdata pyflakes
+
+      - name: Versions
+        run: |
+          python3 --version
+          python3 -c "import tkinter, PIL; print('tk', tkinter.TkVersion, '| Pillow', PIL.__version__)"
+
+      - name: Lint
+        run: python3 -m pyflakes solari.py test_solari.py
+
+      # Under Xvfb the GUI tests run too; without a display they skip
+      # themselves, so a missing display would silently shrink the suite.
+      - name: Tests
+        run: xvfb-run -a python3 -m unittest test_solari -v
+
+      - name: App starts
+        run: xvfb-run -a python3 solari.py --selftest
+
+  windows:
+    name: "Tests (Windows, Python ${{ matrix.python }})"
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip Pillow tzdata
+
+      # Windows runners have a real display, so the GUI tests run for real on
+      # the platform Solari actually targets.
+      - name: Tests
+        run: python -m unittest test_solari -v
+
+      - name: App starts
+        run: python solari.py --selftest
+
+  build:
+    name: Build EXE (Windows)
+    runs-on: windows-latest
+    needs: windows
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Runs the real BUILD.bat, so a broken build script fails here rather
+      # than on someone's desktop. SOLARI_CI skips its pauses.
+      - name: Run BUILD.bat
+        shell: cmd
+        env:
+          SOLARI_CI: "1"
+        run: BUILD.bat
+
+      - name: Frozen exe starts
+        shell: cmd
+        run: |
+          dir dist
+          dist\Solari.exe --selftest
+          if errorlevel 1 exit /b 1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Solari-exe
+          path: dist/Solari.exe
+          if-no-files-found: error

@@ -1,5 +1,7 @@
 # 🕐 Solari
 
+[![CI](https://github.com/cervezagua/Solari/actions/workflows/ci.yml/badge.svg)](https://github.com/cervezagua/Solari/actions/workflows/ci.yml)
+
 Floating flip-clock widgets for your Windows desktop.
 Each timezone lives in its own frameless, draggable, always-on-top window with a drum-roll animation.
 
@@ -94,8 +96,20 @@ corrupt or partly-invalid file), off-screen clamping, UTC-offset and day-badge
 formatting, and the card renderer — all without a display.
 
 A second group drives the widgets themselves (the flip animation's visible
-state, relayout, rescale) and is skipped automatically when no display is
-available, so the same command works on a build agent and on your desktop.
+state, relayout, rescale, and that the chassis reaches every window edge) and
+is skipped automatically when no display is available, so the same command
+works on a build agent and on your desktop.
+
+`python solari.py --selftest` starts the app, runs a few real ticks and exits
+with a status code — handy for checking a build without watching it.
+
+### CI
+
+Every push runs the suite on Linux (under Xvfb) and on Windows across Python
+3.10 and 3.13, then executes `BUILD.bat` on a Windows runner and launches the
+resulting `Solari.exe --selftest`. So a broken build script or a missing
+PyInstaller hidden import fails in CI rather than on your desktop, and each
+run uploads the built exe as an artifact.
 
 ---
 

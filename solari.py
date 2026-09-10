@@ -2089,10 +2089,21 @@ class App(tk.Tk):
             pass
 
 
-def main():
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
     enable_dpi_awareness()
-    App().mainloop()
+    app = App()
+    if "--selftest" in argv:
+        # Start every window, run real ticks, quit.  CI uses this against the
+        # frozen exe, where a missing hidden import only shows up at runtime.
+        app.after(1500, app.quit_app)
+        app.mainloop()
+        print(f"selftest OK - {len(app.configs)} clocks, "
+              f"Pillow={HAS_PIL}, tray={HAS_TRAY}")
+        return 0
+    app.mainloop()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
