@@ -1,11 +1,28 @@
 """
-Solari — Flip-Clock Desktop Widget
-Drum-roll animation · Corner-drag resize · Author: Cervezagua
+Solari - Flip-Clock Desktop Widget
+Drum-roll animation - Corner-drag resize - Author: Cervezagua
+
+Rendering notes
+---------------
+Tk's canvas has no antialiasing and no gradient fill, so anything drawn with
+canvas primitives is permanently faceted and flat.  Every dimensional surface
+here (card faces, window chassis) is therefore rendered once with Pillow at a
+supersampled size, downsampled with LANCZOS, and cached - then blitted as a
+single image item.  That is both prettier and cheaper than redrawing polygons
+every animation frame.  Without Pillow the app falls back to plain canvas
+drawing and still runs.
 """
 
+import datetime
+import functools
+import json
+import os
+import sys
+import time
 import tkinter as tk
+import tkinter.font
 import tkinter.messagebox
-import datetime, zoneinfo, json, os, sys
+import zoneinfo
 
 try:
     import winreg
@@ -13,58 +30,71 @@ try:
 except ImportError:
     HAS_WINREG = False
 
+# Pillow and pystray are independent optional deps.  Importing them together
+# means a machine with Pillow but no pystray gets neither.
+try:
+    from PIL import Image, ImageDraw, ImageFilter, ImageTk
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+
 try:
     import pystray
-    from PIL import Image, ImageDraw
-    HAS_TRAY = True
+    HAS_TRAY = HAS_PIL
 except ImportError:
     HAS_TRAY = False
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Config  →  %APPDATA%\Solari\
-# ─────────────────────────────────────────────────────────────────────────────
-APP_NAME    = "Solari"
+IS_WINDOWS = sys.platform.startswith("win")
+APP_NAME = "Solari"
 STARTUP_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+CONFIG_VERSION = 2
 
-def config_dir():
-    base = os.environ.get("APPDATA") or os.path.expanduser("~")
-    d = os.path.join(base, APP_NAME)
-    os.makedirs(d, exist_ok=True)
-    return d
 
-def config_path():
-    return os.path.join(config_dir(), "solari_config.json")
-
-def exe_path():
-    return sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__)
-
-def set_startup(enable):
-    if not HAS_WINREG: return False
+# ---------------------------------------------------------------------------
+#  High-DPI
+#
+#  Must run before any Tk window exists.  Without it Windows bitmap-stretches
+#  the whole app on any scaled display, which no amount of drawing quality can
+#  recover from.
+# ---------------------------------------------------------------------------
+def enable_dpi_awareness():
+    if not IS_WINDOWS:
+        return
     try:
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_KEY, 0, winreg.KEY_SET_VALUE)
-        if enable:
-            winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, f'"{exe_path()}"')
-        else:
-            try: winreg.DeleteValue(key, APP_NAME)
-            except FileNotFoundError: pass
-        winreg.CloseKey(key)
-        return True
-    except Exception: return False
+        import ctypes
+        try:
+            # 2 = per-monitor aware
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except (AttributeError, OSError):
+            ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
 
-def get_startup():
-    if not HAS_WINREG: return False
-    try:
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_KEY, 0, winreg.KEY_READ)
-        winreg.QueryValueEx(key, APP_NAME)
-        winreg.CloseKey(key)
-        return True
-    except Exception: return False
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Colour palette
-#  Fix #2: "Grey" = the dark card bg (#1e1e1e) that appears behind white text —
-#  exactly the shade requested. Not a mid-grey.
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+#  Theme
+#
+#  Single source of truth.  Everything that used to be a scattered hex literal
+#  lives here.
+# ---------------------------------------------------------------------------
+THEME = {
+    "bg":          "#0b0b0d",   # dialog / manager background
+    "chassis":     "#131316",   # clock widget body
+    "well":        "#08080a",   # recessed area directly behind the flip cards
+    "surface":     "#1a1a1f",   # raised control background
+    "surface_hi":  "#232329",   # hover
+    "text":        "#f2f2f5",
+    "text_dim":    "#9a9aa4",
+    "text_faint":  "#55555f",
+    "accent":      "#3d7dd6",
+    "accent_hi":   "#4f92ec",
+    "danger":      "#e5484d",
+    "divider":     "#26262c",
+    "colon":       "#b4b4c4",   # peak of the per-second pulse
+    "colon_dim":   "#4a4a58",   # rest - most of each second is spent here
+}
+
+# Colour swatches offered in the editor
 PALETTE = [
     ("#ffffff", "White"),
     ("#1e1e1e", "Grey"),
@@ -79,7 +109,7 @@ PALETTE = [
     ("#000000", "Black"),
 ]
 
-# Default dark card tint paired with each text colour
+# Default card tint paired with each text colour
 PAL_DARK = {
     "#ffffff": "#1e1e1e",
     "#1e1e1e": "#111111",
@@ -94,793 +124,2309 @@ PAL_DARK = {
     "#000000": "#0a0a0a",
 }
 
-ALL_ZONES = sorted(zoneinfo.available_timezones())
-
-DEFAULT_CONFIG = [
-    {"tz":"America/New_York","label":"New York","x":60, "y":80,"text_color":"#ffffff","card_color":"#1e1e1e","scale":1.0},
-    {"tz":"Europe/London",   "label":"London",  "x":500,"y":80,"text_color":"#2277ff","card_color":"#001033","scale":1.0},
-    {"tz":"Asia/Tokyo",      "label":"Tokyo",   "x":940,"y":80,"text_color":"#cc0000","card_color":"#1a0000","scale":1.0},
+# Curated text + card pairings, so a look can be picked in one click
+PRESETS = [
+    ("Classic",  "#ffffff", "#1e1e1e"),
+    ("Midnight", "#2277ff", "#001033"),
+    ("Ember",    "#ff7700", "#1a0a00"),
+    ("Signal",   "#cc0000", "#1a0000"),
+    ("Matrix",   "#00ff41", "#001a08"),
+    ("Gold",     "#ffd700", "#1a1400"),
+    ("Amethyst", "#8833cc", "#0d0020"),
+    ("Steel",    "#aaaaaa", "#111111"),
 ]
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Card geometry (base at scale = 1.0)
-# ─────────────────────────────────────────────────────────────────────────────
-BASE_W  = 82
-BASE_H  = 104   # full card height — no divider gap
-BASE_FS = 60    # font pt
-BASE_R  = 10    # corner radius
-
+# Text colours that get the neon rim treatment
 NEON = {"#00ff41"}
 
-def _darken(hex_c, f):
+ALL_ZONES = sorted(zoneinfo.available_timezones())
+
+COLOR_CYCLE = ["#ffffff", "#2277ff", "#cc0000", "#00aa00", "#ffd700", "#8833cc"]
+
+
+# ---------------------------------------------------------------------------
+#  Fonts
+#
+#  "Segoe UI" silently falls back to a default Tk font off Windows, which looks
+#  wrong rather than merely different.  Resolve once against what's installed.
+# ---------------------------------------------------------------------------
+UI_FAMILY = "Segoe UI"
+DIGIT_FAMILY = "Segoe UI"
+
+_UI_PREFS = ("Segoe UI", "Inter", "SF Pro Text", "Helvetica Neue",
+             "DejaVu Sans", "Liberation Sans", "Arial")
+_DIGIT_PREFS = ("Segoe UI", "Inter", "SF Pro Display", "Helvetica Neue",
+                "DejaVu Sans", "Liberation Sans", "Arial")
+
+
+def resolve_fonts(root):
+    """Pick the first installed family from each preference list."""
+    global UI_FAMILY, DIGIT_FAMILY
+    try:
+        available = {f.lower() for f in tkinter.font.families(root)}
+    except tk.TclError:
+        return
+    for pref, target in ((_UI_PREFS, "ui"), (_DIGIT_PREFS, "digit")):
+        for fam in pref:
+            if fam.lower() in available:
+                if target == "ui":
+                    UI_FAMILY = fam
+                else:
+                    DIGIT_FAMILY = fam
+                break
+
+
+def ui_font(size, weight="normal"):
+    """Point-sized: follows the display DPI, for the manager and dialogs."""
+    return (UI_FAMILY, size, weight)
+
+
+def ui_font_px(size, weight="normal"):
+    """Pixel-sized (negative Tk size): for chrome on the clock widget, whose
+    geometry is in pixels and must not be re-scaled underneath it."""
+    return (UI_FAMILY, -abs(size), weight)
+
+
+def digit_font(size):
+    return (DIGIT_FAMILY, -abs(size), "bold")
+
+
+# ---------------------------------------------------------------------------
+#  Colour maths
+#
+#  These sit in the animation hot path, so they memoise.  Callers quantise
+#  continuous factors (see QUANT) before calling, otherwise every frame is a
+#  cache miss.
+# ---------------------------------------------------------------------------
+QUANT = 32.0
+
+
+def quantise(t):
+    """Snap a 0..1 factor to 1/32 steps so the colour caches actually hit."""
+    return round(max(0.0, min(1.0, t)) * QUANT) / QUANT
+
+
+@functools.lru_cache(maxsize=512)
+def to_rgb(hex_c):
     h = hex_c.lstrip("#")
-    r, g, b = int(h[0:2],16), int(h[2:4],16), int(h[4:6],16)
-    return f"#{int(r*f):02x}{int(g*f):02x}{int(b*f):02x}"
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
 
-def _lerp(a, b, t):
-    ah, bh = a.lstrip("#"), b.lstrip("#")
-    ra,ga,ba = int(ah[0:2],16), int(ah[2:4],16), int(ah[4:6],16)
-    rb,gb,bb = int(bh[0:2],16), int(bh[2:4],16), int(bh[4:6],16)
-    return f"#{int(ra+(rb-ra)*t):02x}{int(ga+(gb-ga)*t):02x}{int(ba+(bb-ba)*t):02x}"
 
-def _smoothstep(t):
+def _clamp8(v):
+    return 0 if v < 0 else (255 if v > 255 else int(v))
+
+
+def to_hex(r, g, b):
+    return f"#{_clamp8(r):02x}{_clamp8(g):02x}{_clamp8(b):02x}"
+
+
+@functools.lru_cache(maxsize=1024)
+def darken(hex_c, f):
+    r, g, b = to_rgb(hex_c)
+    return to_hex(r * f, g * f, b * f)
+
+
+@functools.lru_cache(maxsize=1024)
+def lighten(hex_c, f):
+    """Scale toward white rather than multiplying, so near-black still lifts."""
+    r, g, b = to_rgb(hex_c)
+    return to_hex(r + (255 - r) * f, g + (255 - g) * f, b + (255 - b) * f)
+
+
+@functools.lru_cache(maxsize=2048)
+def lerp(a, b, t):
+    ra, ga, ba = to_rgb(a)
+    rb, gb, bb = to_rgb(b)
+    return to_hex(ra + (rb - ra) * t, ga + (gb - ga) * t, ba + (bb - ba) * t)
+
+
+def smoothstep(t):
+    t = max(0.0, min(1.0, t))
     return t * t * (3 - 2 * t)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  FlipCard  —  DRUM ROLL  (slot machine scroll upward)
+def is_neon(text_color):
+    return text_color.lower() in NEON
+
+
+# ---------------------------------------------------------------------------
+#  Config
 #
-#  Fix #3: NO divider. The card is one unbroken rounded rectangle.
-#  Two stacked Canvas widgets (top-half / bottom-half) give natural clipping.
-#  Drum roll: old digit scrolls off top, new digit enters from bottom.
-# ─────────────────────────────────────────────────────────────────────────────
-DRUM_STEPS = 12
-DRUM_MS    = 14
+#  Windows keeps %APPDATA%\Solari so existing installs carry over untouched.
+# ---------------------------------------------------------------------------
+def config_dir():
+    if IS_WINDOWS:
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    elif sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Application Support")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    d = os.path.join(base, APP_NAME)
+    os.makedirs(d, exist_ok=True)
+    return d
 
-class FlipCard(tk.Frame):
 
-    def __init__(self, parent, text_color="#ffffff", card_color="#1e1e1e",
-                 scale=1.0, **kw):
-        super().__init__(parent, bg="#000000", **kw)
-        self.text_color = text_color
-        self.card_color = card_color
-        self._cur  = "0"
-        self._nxt  = "0"
-        self._busy = False
-        self._apply_scale(scale)
-        self._build_canvases()
-        self._draw_static(self._cur)
+def config_path():
+    return os.path.join(config_dir(), "solari_config.json")
 
-    def _apply_scale(self, scale):
-        self.scale = scale
-        self.W   = max(20, int(BASE_W  * scale))
-        self.H   = max(24, int(BASE_H  * scale))
-        self.MID = self.H // 2
-        self.R   = max(3,  int(BASE_R  * scale))
-        self.FS  = max(8,  int(BASE_FS * scale))
 
-    def _build_canvases(self):
-        for w in self.winfo_children():
-            w.destroy()
-        # Two half-height canvases — no gap frame between them
-        self._top = tk.Canvas(self, width=self.W, height=self.MID,
-                               bg="#000000", highlightthickness=0)
-        self._top.pack(side="top")
-        self._bot = tk.Canvas(self, width=self.W, height=self.MID,
-                               bg="#000000", highlightthickness=0)
-        self._bot.pack(side="top")
+def pretty_path(p, limit=44):
+    """Shorten a config path for display without losing the tail."""
+    appdata = os.environ.get("APPDATA")
+    if IS_WINDOWS and appdata and p.lower().startswith(appdata.lower()):
+        p = "%APPDATA%" + p[len(appdata):]
+    else:
+        home = os.path.expanduser("~")
+        if home and p.startswith(home):
+            p = "~" + p[len(home):]
+    if len(p) > limit:
+        p = p[:limit // 2 - 2] + "..." + p[-(limit // 2 - 1):]
+    return p
 
-    # ── rounded rect ─────────────────────────────────────────────────────────
-    def _rr(self, cv, x1, y1, x2, y2, **kw):
-        r = min(self.R, (x2-x1)//2, (y2-y1)//2)
-        pts = [
-            x1+r,y1, x2-r,y1, x2,y1,   x2,y1+r,
-            x2,y2-r, x2,y2,   x2-r,y2, x1+r,y2,
-            x1,y2,   x1,y2-r, x1,y1+r, x1,y1,
-        ]
-        return cv.create_polygon(pts, smooth=True, **kw)
 
-    # ── draw one half-canvas ─────────────────────────────────────────────────
-    def _draw_half(self, cv, is_top, strips):
-        """
-        strips: list of (digit, y_offset, alpha)
-          y_offset: vertical pixel shift of the digit centre from its natural position
-          alpha:    brightness 0..1
-        """
-        cv.delete("all")
-        W, MID, H = self.W, self.MID, self.H
-        cc   = self.card_color
-        neon = self.text_color.lower() in NEON
-        FONT = ("Segoe UI", self.FS, "bold")
+def exe_path():
+    return sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__)
 
-        # Card background — full card drawn, canvas clips to its half
-        if is_top:
-            self._rr(cv, 0, 0, W, H, fill=cc, outline="")
-        else:
-            self._rr(cv, 0, -MID, W, MID, fill=cc, outline="")
 
-        for digit, y_off, alpha in strips:
-            if alpha < 0.02:
-                continue
-            tc     = _darken(self.text_color, max(0.0, alpha))
-            bg_mix = _lerp(cc, "#000000", max(0.0, 1.0 - alpha))
+def asset_path(name):
+    """Locate a bundled file both in-tree and inside a PyInstaller bundle."""
+    base = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
+    p = os.path.join(base, name)
+    return p if os.path.exists(p) else None
 
-            # Canvas y of the digit centre
-            cy = (MID + y_off) if is_top else (0 + y_off)
 
-            # Scroll band — darker strip behind the moving digit
-            if alpha < 0.92:
-                band_h = max(4, int(H * 0.45))
-                by1 = max(0, cy - band_h // 2)
-                by2 = min(MID, cy + band_h // 2)
-                if by2 > by1:
-                    cv.create_rectangle(0, by1, W, by2, fill=bg_mix, outline="")
-
-            if neon and alpha > 0.25:
-                for off in (3, 2, 1):
-                    cv.create_text(W//2, cy, text=digit, font=FONT,
-                                   fill=_darken(self.text_color, off*0.15*alpha),
-                                   anchor="center")
-            cv.create_text(W//2, cy, text=digit, font=FONT, fill=tc, anchor="center")
-
-        if neon:
-            gc = _darken(self.text_color, 0.55)
-            if is_top:
-                self._rr(cv, 0, 0, W, H, fill="", outline=gc, width=2)
+def set_startup(enable):
+    if not HAS_WINREG:
+        return False
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_KEY, 0, winreg.KEY_SET_VALUE)
+        try:
+            if enable:
+                winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, f'"{exe_path()}"')
             else:
-                self._rr(cv, 0, -MID, W, MID, fill="", outline=gc, width=2)
+                try:
+                    winreg.DeleteValue(key, APP_NAME)
+                except FileNotFoundError:
+                    pass
+        finally:
+            winreg.CloseKey(key)
+        return True
+    except OSError:
+        return False
 
-    def _draw_static(self, d):
-        self._draw_half(self._top, True,  [(d, 0, 1.0)])
-        self._draw_half(self._bot, False, [(d, 0, 1.0)])
 
-    # ── public ────────────────────────────────────────────────────────────────
-    def set(self, digit):
-        if digit == self._cur: return
-        if self._busy:
-            self._nxt = digit; return
-        self._nxt  = digit
-        self._busy = True
-        self._drum(0)
+def get_startup():
+    if not HAS_WINREG:
+        return False
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_KEY, 0, winreg.KEY_READ)
+        try:
+            winreg.QueryValueEx(key, APP_NAME)
+        finally:
+            winreg.CloseKey(key)
+        return True
+    except OSError:
+        return False
 
-    def update_colors(self, tc, cc):
-        self.text_color = tc
-        self.card_color = cc
-        if not self._busy:
-            self._draw_static(self._cur)
 
-    def rebuild(self, scale):
-        old = self._cur
-        self._apply_scale(scale)
-        self._build_canvases()
-        self._cur = old
-        self._draw_static(self._cur)
+DEFAULT_CLOCK = {
+    "tz": "UTC",
+    "label": "UTC",
+    "x": 100,
+    "y": 100,
+    "text_color": "#ffffff",
+    "card_color": "#1e1e1e",
+    "scale": 1.0,
+    "hour24": True,
+    "show_seconds": True,
+    "opacity": 0.97,
+    "topmost": True,
+}
 
-    # ── drum roll ─────────────────────────────────────────────────────────────
-    def _drum(self, step):
-        t   = _smoothstep(step / DRUM_STEPS)
-        H   = self.H
+DEFAULT_CONFIG = [
+    dict(DEFAULT_CLOCK, tz="America/New_York", label="New York",
+         x=60, y=80, text_color="#ffffff", card_color="#1e1e1e"),
+    dict(DEFAULT_CLOCK, tz="Europe/London", label="London",
+         x=500, y=80, text_color="#2277ff", card_color="#001033"),
+    dict(DEFAULT_CLOCK, tz="Asia/Tokyo", label="Tokyo",
+         x=940, y=80, text_color="#cc0000", card_color="#1a0000"),
+]
 
-        old_off   = int(-H * t)
-        nxt_off   = int( H * (1.0 - t))
-        old_alpha = max(0.0, 1.0 - t * 1.4)
-        nxt_alpha = max(0.0, (t - 0.3) / 0.7)
+SCALE_MIN = 0.4
+SCALE_MAX = 3.0
+OPACITY_MIN = 0.35
+OPACITY_MAX = 1.0
 
-        strips = []
-        if old_alpha > 0.02: strips.append((self._cur, old_off, old_alpha))
-        if nxt_alpha > 0.02: strips.append((self._nxt, nxt_off, nxt_alpha))
+_HEX_OK = set("0123456789abcdefABCDEF")
 
-        self._draw_half(self._top, True,  strips)
-        self._draw_half(self._bot, False, strips)
 
-        if step < DRUM_STEPS:
-            self.after(DRUM_MS, lambda: self._drum(step + 1) if self.winfo_exists() else None)
+def _valid_hex(v, fallback):
+    if isinstance(v, str) and len(v) == 7 and v[0] == "#" and all(c in _HEX_OK for c in v[1:]):
+        return v.lower()
+    return fallback
+
+
+def _num(v, lo, hi, fallback):
+    try:
+        n = float(v)
+    except (TypeError, ValueError):
+        return fallback
+    if n != n:  # NaN
+        return fallback
+    return max(lo, min(hi, n))
+
+
+def migrate_clock(raw):
+    """Normalise one clock entry from any past schema. Returns None if unusable."""
+    if not isinstance(raw, dict):
+        return None
+    c = dict(DEFAULT_CLOCK)
+
+    tz = raw.get("tz")
+    if not isinstance(tz, str) or not tz:
+        return None
+    try:
+        zoneinfo.ZoneInfo(tz)
+    except (zoneinfo.ZoneInfoNotFoundError, ValueError, OSError):
+        return None
+    c["tz"] = tz
+
+    label = raw.get("label")
+    c["label"] = label.strip() if isinstance(label, str) and label.strip() else tz.split("/")[-1].replace("_", " ")
+
+    # v0 used a single "color" key
+    text_color = raw.get("text_color", raw.get("color", "#ffffff"))
+    text_color = _valid_hex(text_color, "#ffffff")
+    # v0/v1 greys that read as muddy against the new chassis
+    if text_color in ("#bbbbbb", "#ddcc00"):
+        text_color = "#ffffff"
+    c["text_color"] = text_color
+    c["card_color"] = _valid_hex(raw.get("card_color"), PAL_DARK.get(text_color, "#1e1e1e"))
+
+    c["x"] = int(_num(raw.get("x"), -30000, 30000, 100))
+    c["y"] = int(_num(raw.get("y"), -30000, 30000, 100))
+    c["scale"] = round(_num(raw.get("scale"), SCALE_MIN, SCALE_MAX, 1.0), 2)
+    c["opacity"] = round(_num(raw.get("opacity"), OPACITY_MIN, OPACITY_MAX, 0.97), 2)
+    c["hour24"] = bool(raw.get("hour24", True))
+    c["show_seconds"] = bool(raw.get("show_seconds", True))
+    c["topmost"] = bool(raw.get("topmost", True))
+    return c
+
+
+def load_config(path=None):
+    """Read config, dropping only the entries that are unusable.
+
+    A single bad entry used to discard the whole file (and the bare `assert`
+    that guarded it vanished under `python -O`).
+    """
+    path = path or config_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return [dict(c) for c in DEFAULT_CONFIG]
+
+    if isinstance(data, dict):           # v2 wrapper form
+        data = data.get("clocks", [])
+    if not isinstance(data, list):
+        return [dict(c) for c in DEFAULT_CONFIG]
+
+    clocks = [m for m in (migrate_clock(c) for c in data) if m]
+    return clocks or [dict(c) for c in DEFAULT_CONFIG]
+
+
+def save_config(configs, path=None):
+    """Write atomically - a crash mid-write used to truncate the config."""
+    path = path or config_path()
+    payload = {"version": CONFIG_VERSION, "clocks": configs}
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
+
+
+def clamp_to_screen(x, y, w, h, sw, sh, margin=24):
+    """Keep at least `margin` px of the widget reachable on screen.
+
+    A clock last positioned on a monitor that is no longer attached would
+    otherwise restore off-screen with no way to get it back.
+    """
+    x = min(x, sw - margin)
+    x = max(x, margin - w)
+    y = min(y, sh - margin)
+    y = max(y, 0)
+    return int(x), int(y)
+
+
+# ---------------------------------------------------------------------------
+#  Card rendering
+#
+#  Card faces are pre-blended against the colour they sit on rather than kept
+#  transparent, so their antialiased corners composite exactly and the widget
+#  can stay a plain opaque image item.  The area behind the cards is therefore
+#  a flat well colour - the chassis gradient lives outside it.
+# ---------------------------------------------------------------------------
+CARD_SS = 3          # supersample factor before LANCZOS downsample
+BASE_W = 82          # card geometry at scale 1.0
+BASE_H = 104
+BASE_FS = 78         # digit height in px
+BASE_R = 12          # corner radius
+
+
+def _lerp_raw(a, b, t):
+    """Uncached lerp for bulk gradient work, so it can't evict the hot cache."""
+    ra, ga, ba = to_rgb(a)
+    rb, gb, bb = to_rgb(b)
+    return to_hex(ra + (rb - ra) * t, ga + (gb - ga) * t, ba + (bb - ba) * t)
+
+
+def _vgrad(w, h, stops):
+    """Vertical gradient RGB image. stops = [(pos 0..1, hex), ...] ascending."""
+    img = Image.new("RGB", (w, h))
+    d = ImageDraw.Draw(img)
+    last = len(stops) - 1
+    for y in range(h):
+        t = y / max(1, h - 1)
+        for i in range(last):
+            p0, c0 = stops[i]
+            p1, c1 = stops[i + 1]
+            if t <= p1 or i == last - 1:
+                span = (p1 - p0) or 1.0
+                d.line([(0, y), (w, y)], fill=_lerp_raw(c0, c1, max(0.0, min(1.0, (t - p0) / span))))
+                break
+    return img
+
+
+def _vramp(w, h, a0, a1, p0=0.0, p1=1.0):
+    """L-mode vertical alpha ramp, a0 at p0 fading to a1 at p1."""
+    img = Image.new("L", (w, h), 0)
+    d = ImageDraw.Draw(img)
+    for y in range(h):
+        t = y / max(1, h - 1)
+        if t <= p0:
+            v = a0
+        elif t >= p1:
+            v = a1
         else:
-            self._cur  = self._nxt
-            self._busy = False
-            if self.winfo_exists():
-                self._draw_static(self._cur)
+            v = a0 + (a1 - a0) * ((t - p0) / ((p1 - p0) or 1.0))
+        d.line([(0, y), (w, y)], fill=int(v))
+    return img
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  ClockWindow
-# ─────────────────────────────────────────────────────────────────────────────
-SCALE_MIN  = 0.4
-SCALE_MAX  = 3.0
-HANDLE_PX  = 14   # corner handle size
+def _body_gradient(W, H, fill, inset, strength):
+    """The lit-from-above body. Inverted for a recessed surface."""
+    if inset:
+        return _vgrad(W, H, [
+            (0.00, darken(fill, 1.0 - 0.34 * strength)),
+            (0.55, fill),
+            (1.00, lighten(fill, 0.10 * strength)),
+        ])
+    return _vgrad(W, H, [
+        (0.00, lighten(fill, 0.17 * strength)),
+        (0.50, fill),
+        (0.88, darken(fill, 1.0 - 0.38 * strength)),
+        (1.00, darken(fill, 1.0 - 0.20 * strength)),   # bounce light off the base
+    ])
 
-class ClockWindow(tk.Toplevel):
-    def __init__(self, master, cfg, on_close, on_edit):
-        super().__init__(master)
-        self.cfg      = cfg
-        self.on_close = on_close
-        self.on_edit  = on_edit
-        self._drag    = None   # (off_x, off_y) for window move
-        self._resize  = None   # (root_x, root_y, scale0, win_x, win_y) for resize
-        self._prev    = {}
-        self._scale   = float(cfg.get("scale", 1.0))
 
-        self.overrideredirect(True)
-        self.wm_attributes("-topmost", True)
-        self.wm_attributes("-alpha", 0.97)
-        self.configure(bg="#000000")
+@functools.lru_cache(maxsize=192)
+def render_surface(w, h, radius, fill, behind, glow=None, inset=False,
+                   strength=1.0, ss=CARD_SS):
+    """A shaded surface as an RGB PIL image, already blended onto `behind`.
 
-        self._build_ui()
-        self.geometry(f"+{cfg.get('x',100)}+{cfg.get('y',100)}")
-        self._bind_drag(self)
+    This is the app's one shading model, shared by the flip cards, the manager's
+    rows and every button, so they match by construction rather than by
+    eyeballed constants.
+
+    Lit from above: a body gradient with a touch of bounce light at the base, a
+    specular highlight fading down the top corners, a contact shadow rising from
+    the bottom, and a faint inner bevel.  `inset=True` inverts the lighting for
+    a recessed surface (a well, or a pressed button).  `glow` adds a coloured
+    inner rim.  Corners are pre-blended against `behind`, so the result is
+    opaque and drops straight onto a canvas.
+    """
+    W, H, R = w * ss, h * ss, max(0, radius * ss)
+    body = _body_gradient(W, H, fill, inset, strength)
+
+    mask = Image.new("L", (W, H), 0)
+    ImageDraw.Draw(mask).rounded_rectangle([0, 0, W - 1, H - 1], radius=R, fill=255)
+
+    surf = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    surf.paste(body, (0, 0), mask)
+
+    lw = max(1, int(ss * 1.2))
+    edge = [lw // 2, lw // 2, W - 1 - lw // 2, H - 1 - lw // 2]
+
+    def _edge_layer(colour, a0, a1, p0, p1):
+        layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        ImageDraw.Draw(layer).rounded_rectangle(edge, radius=R, outline=colour,
+                                                width=lw)
+        layer.putalpha(Image.composite(_vramp(W, H, a0, a1, p0, p1),
+                                       Image.new("L", (W, H), 0),
+                                       layer.split()[3]))
+        return layer
+
+    hi = int(132 * strength)
+    lo = int(150 * strength)
+    if inset:
+        # Recessed: shadow across the top, light along the bottom lip.
+        surf = Image.alpha_composite(surf, _edge_layer((0, 0, 0, 255), lo, 0, 0.0, 0.5))
+        surf = Image.alpha_composite(surf, _edge_layer((255, 255, 255, 255), 0, hi, 0.6, 1.0))
+    else:
+        surf = Image.alpha_composite(surf, _edge_layer((255, 255, 255, 255), hi, 0, 0.0, 0.42))
+        surf = Image.alpha_composite(surf, _edge_layer((0, 0, 0, 255), 0, lo, 0.55, 1.0))
+
+        # Inner bevel - a second, inset edge that sells thickness
+        bevel = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        pad = lw * 2
+        ImageDraw.Draw(bevel).rounded_rectangle(
+            [pad, pad, W - 1 - pad, H - 1 - pad], radius=max(0, R - pad),
+            outline=(255, 255, 255, 255), width=max(1, lw // 2))
+        bevel.putalpha(Image.composite(_vramp(W, H, int(46 * strength), 0, 0.0, 0.30),
+                                       Image.new("L", (W, H), 0), bevel.split()[3]))
+        surf = Image.alpha_composite(surf, bevel)
+
+    if glow:
+        rr, gg, bb = to_rgb(glow)
+        halo = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        ImageDraw.Draw(halo).rounded_rectangle(
+            [lw, lw, W - 1 - lw, H - 1 - lw], radius=max(0, R - lw),
+            outline=(rr, gg, bb, 210), width=lw)
+        halo = halo.filter(ImageFilter.GaussianBlur(ss * 1.6))
+        halo.putalpha(Image.composite(halo.split()[3], Image.new("L", (W, H), 0), mask))
+        surf = Image.alpha_composite(surf, halo)
+
+    out = Image.new("RGB", (W, H), behind)
+    out.paste(surf, (0, 0), surf)
+    return out.resize((w, h), Image.LANCZOS)
+
+
+@functools.lru_cache(maxsize=96)
+def render_card(w, h, radius, card_color, rim_color, behind, rolling):
+    """One flip card face: the shared surface, plus the drum-interior shade."""
+    base = render_surface(w, h, radius, card_color, behind, glow=rim_color)
+    if not rolling:
+        return base
+
+    # Recessed drum interior: darken the band the digit travels through.  A
+    # soft vertical falloff needs no supersampling, so this works at final size.
+    shade = Image.new("L", (w, h), 0)
+    d = ImageDraw.Draw(shade)
+    band = max(1, int(h * 0.62))
+    top = (h - band) // 2
+    for i in range(band):
+        t = i / max(1, band - 1)
+        # smooth bell, strongest at the centre of the travel
+        d.line([(0, top + i), (w, top + i)],
+               fill=int(86 * (1.0 - abs(2.0 * t - 1.0)) ** 0.8))
+    return Image.composite(Image.new("RGB", (w, h), "#000000"), base, shade)
+
+
+# ---------------------------------------------------------------------------
+#  Ticker
+#
+#  One second-aligned timer and one animation loop for the whole app.  Each
+#  clock used to run its own 250 ms poll plus a 500 ms blink, so N clocks meant
+#  6N timers a second and digits flipped up to 250 ms after the real second.
+# ---------------------------------------------------------------------------
+FRAME_MS = 16               # ~60 fps while something is actually moving
+DRUM_DURATION = 0.19        # seconds, wall-clock
+
+
+class Ticker:
+    def __init__(self, root):
+        self._root = root
+        self._clocks = []
+        self._anim = set()
+        self._tick_job = None
+        self._anim_job = None
+        self._running = False
+
+    def subscribe(self, clock):
+        if clock not in self._clocks:
+            self._clocks.append(clock)
+
+    def unsubscribe(self, clock):
+        if clock in self._clocks:
+            self._clocks.remove(clock)
+        self._anim.discard(clock)
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
         self._tick()
 
-    def _tc(self): return self.cfg.get("text_color", "#ffffff")
-    def _cc(self): return self.cfg.get("card_color", "#1e1e1e")
+    def stop(self):
+        self._running = False
+        for job in (self._tick_job, self._anim_job):
+            if job:
+                try:
+                    self._root.after_cancel(job)
+                except tk.TclError:
+                    pass
+        self._tick_job = self._anim_job = None
+        self._clocks.clear()
+        self._anim.clear()
 
-    def _build_ui(self):
+    def _tick(self):
+        self._tick_job = None
+        if not self._running:
+            return
+        now = time.time()
+        for clock in list(self._clocks):
+            try:
+                clock.on_second(now)
+            except tk.TclError:
+                self.unsubscribe(clock)
+        # Re-aim at the next true second boundary every time, so the clock
+        # cannot drift no matter how long the tick itself took.
+        delay = int((1.0 - (time.time() % 1.0)) * 1000) + 3
+        self._tick_job = self._root.after(max(20, min(1000, delay)), self._tick)
+
+    def animate(self, target):
+        """Register anything exposing step(now) -> keep_going."""
+        self._anim.add(target)
+        if self._anim_job is None and self._running:
+            self._anim_job = self._root.after(FRAME_MS, self._frame)
+
+    def _frame(self):
+        self._anim_job = None
+        if not self._running:
+            return
+        now = time.perf_counter()
+        for target in list(self._anim):
+            try:
+                if not target.step(now):
+                    self._anim.discard(target)
+            except tk.TclError:
+                self._anim.discard(target)
+        if self._anim:
+            self._anim_job = self._root.after(FRAME_MS, self._frame)
+
+
+# ---------------------------------------------------------------------------
+#  FlipCard
+#
+#  A single canvas sized exactly to the card, so a digit scrolling past the top
+#  edge is clipped by the canvas for free.  (The old two-half-canvas split was
+#  left over from a real flip design and doubled every draw once the divider
+#  was dropped.)  Items are created once and animated with coords() and
+#  itemconfigure() - nothing is deleted or recreated per frame.
+# ---------------------------------------------------------------------------
+class FlipCard(tk.Canvas):
+
+    def __init__(self, parent, ticker, text_color, card_color, scale=1.0,
+                 behind=None):
+        self._behind = behind or THEME["well"]
+        self.text_color = text_color
+        self.card_color = card_color
+        self._apply_scale(scale)
+        super().__init__(parent, width=self.W, height=self.H,
+                         bg=self._behind, highlightthickness=0, bd=0,
+                         takefocus=0)
+        self.ticker = ticker
+        self._cur = "0"
+        self._nxt = "0"
+        self._rolling = False
+        self._t0 = 0.0
+        self._photo_idle = None     # strong refs: an unreferenced PhotoImage is
+        self._photo_roll = None     # collected and the card silently blanks
+        self._bg = None
+        self._build()
+
+    # -- geometry ----------------------------------------------------------
+    def _apply_scale(self, scale):
+        self.scale = scale
+        self.W = max(20, int(BASE_W * scale))
+        self.H = max(24, int(BASE_H * scale))
+        self.R = max(3, int(BASE_R * scale))
+        self.FS = max(8, int(BASE_FS * scale))
+
+    # -- construction ------------------------------------------------------
+    def _build(self):
+        self._render_faces()
+        if HAS_PIL:
+            self._bg = self.create_image(0, 0, anchor="nw", image=self._photo_idle)
+        else:
+            self._bg = self._fallback_face()
+        cy = self.H // 2
+        font = digit_font(self.FS)
+        self._txt_a = self.create_text(self.W // 2, cy, text=self._cur,
+                                       font=font, fill=self.text_color,
+                                       anchor="center")
+        self._txt_b = self.create_text(self.W // 2, cy, text=self._nxt,
+                                       font=font, fill=self.text_color,
+                                       anchor="center", state="hidden")
+
+    def _render_faces(self):
+        if not HAS_PIL:
+            return
+        rim = self.text_color if is_neon(self.text_color) else None
+        idle = render_card(self.W, self.H, self.R, self.card_color, rim,
+                           self._behind, False)
+        roll = render_card(self.W, self.H, self.R, self.card_color, rim,
+                           self._behind, True)
+        self._photo_idle = ImageTk.PhotoImage(idle)
+        self._photo_roll = ImageTk.PhotoImage(roll)
+
+    def _fallback_face(self):
+        """Plain rounded polygon when Pillow is missing - flat, but it runs."""
+        r, W, H = self.R, self.W, self.H
+        pts = [r, 0, W - r, 0, W, 0, W, r, W, H - r, W, H,
+               W - r, H, r, H, 0, H, 0, H - r, 0, r, 0, 0]
+        return self.create_polygon(pts, smooth=True, fill=self.card_color,
+                                   outline="")
+
+    def _set_face(self, rolling):
+        if HAS_PIL and self._bg is not None:
+            self.itemconfigure(self._bg,
+                               image=self._photo_roll if rolling else self._photo_idle)
+
+    # -- public ------------------------------------------------------------
+    def set(self, digit):
+        """Roll to `digit`. A digit arriving mid-roll queues for the next one."""
+        if digit == self._cur and not self._rolling:
+            return
+        self._nxt = digit
+        if self._rolling:
+            # Queued mid-roll: retarget the incoming item so the roll lands on
+            # the newest digit instead of animating a stale one in first.
+            self.itemconfigure(self._txt_b, text=digit)
+            return
+        self._rolling = True
+        self._t0 = time.perf_counter()
+        self._set_face(True)
+        # Text only - it stays hidden until step() has somewhere to put it.
+        # Revealing it here left it stacked on the outgoing digit at centre for
+        # one frame, which flashed a doubled digit on every flip.
+        self.itemconfigure(self._txt_b, text=digit)
+        self.ticker.animate(self)
+
+    def set_immediate(self, digit):
+        self._cur = self._nxt = digit
+        self._rolling = False
+        self._set_face(False)
+        # state="normal" is required, not cosmetic: step() hides this item once
+        # the outgoing digit has faded, so landing a roll without restoring it
+        # leaves both items hidden and the card blank.
+        self.itemconfigure(self._txt_a, text=digit, fill=self.text_color,
+                           state="normal")
+        self.coords(self._txt_a, self.W // 2, self.H // 2)
+        self.itemconfigure(self._txt_b, state="hidden")
+
+    def update_style(self, text_color, card_color):
+        self.text_color = text_color
+        self.card_color = card_color
+        self._render_faces()
+        if HAS_PIL:
+            self._set_face(self._rolling)
+        elif self._bg is not None:
+            self.itemconfigure(self._bg, fill=card_color)
+        if not self._rolling:
+            self.itemconfigure(self._txt_a, fill=text_color)
+
+    def rescale(self, scale):
+        """Resize in place - no widget teardown, so live drag resize is cheap."""
+        if abs(scale - self.scale) < 0.005:
+            return
+        self._apply_scale(scale)
+        self.configure(width=self.W, height=self.H)
+        self._render_faces()
+        if HAS_PIL:
+            self._set_face(self._rolling)
+        else:
+            self.delete(self._bg)
+            self._bg = self._fallback_face()
+            self.tag_lower(self._bg)
+        font = digit_font(self.FS)
+        for item in (self._txt_a, self._txt_b):
+            self.itemconfigure(item, font=font)
+        if not self._rolling:
+            self.coords(self._txt_a, self.W // 2, self.H // 2)
+
+    # -- animation ---------------------------------------------------------
+    def step(self, now):
+        """One frame. Returns False when the roll is finished."""
+        t = (now - self._t0) / DRUM_DURATION
+        if t >= 1.0:
+            self.set_immediate(self._nxt)
+            return False
+
+        e = smoothstep(t)
+        cx, cy, H = self.W // 2, self.H // 2, self.H
+        # Outgoing digit rides up and out; incoming rises into place.
+        a_alpha = max(0.0, 1.0 - t * 1.4)
+        b_alpha = max(0.0, min(1.0, (t - 0.3) / 0.7))
+
+        if a_alpha > 0.02:
+            self.coords(self._txt_a, cx, cy - int(H * e))
+            self.itemconfigure(self._txt_a, state="normal",
+                               fill=darken(self.text_color, quantise(a_alpha)))
+        else:
+            self.itemconfigure(self._txt_a, state="hidden")
+
+        if b_alpha > 0.02:
+            self.coords(self._txt_b, cx, cy + int(H * (1.0 - e)))
+            self.itemconfigure(self._txt_b, state="normal",
+                               fill=darken(self.text_color, quantise(b_alpha)))
+        else:
+            self.itemconfigure(self._txt_b, state="hidden")
+        return True
+
+
+# ---------------------------------------------------------------------------
+#  Chassis rendering
+#
+#  The clock widget used to be a stack of flat frames, which read as a black
+#  rectangle with parts glued on.  It is now one raised panel with a recessed
+#  well cut into it, rendered as a single image.
+#
+#  The window itself stays rectangular.  Colour-key transparency is the only
+#  way Tk can round a window, and it cannot blend edges - the antialiased
+#  corner pixels survive as a jagged halo, which looks worse than a bezel.  So
+#  the area outside the panel is pure black and reads as shadow.
+# ---------------------------------------------------------------------------
+CHASSIS_SS = 2
+
+
+@functools.lru_cache(maxsize=48)
+def render_chassis(w, h, pad, radius, well_radius, well, accent):
+    """Full widget background. `well` is the recessed rect in unscaled coords.
+
+    `radius` is the panel's own corner radius and may be 0 for a flush edge;
+    `well_radius` is independent, so the recess keeps its rounding either way.
+    """
+    s = CHASSIS_SS
+    W, H = w * s, h * s
+    P, R = pad * s, max(0, radius * s)
+    base = THEME["chassis"]
+
+    img = Image.new("RGB", (W, H), "#000000")
+
+    panel = _vgrad(W - 2 * P, H - 2 * P, [
+        (0.00, lighten(base, 0.10)),
+        (0.42, base),
+        (1.00, darken(base, 0.66)),
+    ])
+    pmask = Image.new("L", (W - 2 * P, H - 2 * P), 0)
+    ImageDraw.Draw(pmask).rounded_rectangle(
+        [0, 0, W - 2 * P - 1, H - 2 * P - 1], radius=R, fill=255)
+    img.paste(panel, (P, P), pmask)
+
+    lw = max(1, int(s))
+    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+
+    # Rim light along the panel edge, brightest on top - separates the panel
+    # from the black around it.
+    rim = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ImageDraw.Draw(rim).rounded_rectangle(
+        [P, P, W - P - 1, H - P - 1], radius=R,
+        outline=(255, 255, 255, 255), width=lw)
+    rim.putalpha(Image.composite(_vramp(W, H, 74, 12, 0.0, 0.75),
+                                 Image.new("L", (W, H), 0), rim.split()[3]))
+    # In place: rebinding `layer` here would orphan the ImageDraw bound to it,
+    # silently discarding everything drawn afterwards (the well and its shading).
+    layer.alpha_composite(rim)
+
+    # Recessed well: flat fill, because card corners pre-blend against exactly
+    # this colour, plus an inner shadow confined to its padding ring.
+    x1, y1, x2, y2 = (v * s for v in well)
+    wr = max(2, int(well_radius * s))
+    d.rounded_rectangle([x1, y1, x2, y2], radius=wr, fill=THEME["well"])
+
+    depth = max(1, int(s * 2))
+    for i in range(depth * 3):
+        a = int(120 * (1.0 - i / (depth * 3)))
+        d.rounded_rectangle([x1 + i, y1 + i, x2 - i, y2 - i], radius=max(1, wr - i),
+                            outline=(0, 0, 0, a), width=1)
+    # Light catching the bottom lip of the recess.  This has to follow the
+    # well's rounded outline masked to its lower half - an ImageDraw.arc over
+    # the well's bounding box draws an ellipse the full width of the widget,
+    # which reads as a stray curve rather than an edge.
+    lip = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ImageDraw.Draw(lip).rounded_rectangle(
+        [x1, y1, x2, y2], radius=wr, outline=(255, 255, 255, 255), width=lw)
+    top = y1 / H + (y2 - y1) / H * 0.55      # ramp within the well, not the image
+    lip.putalpha(Image.composite(_vramp(W, H, 0, 40, top, y2 / H),
+                                 Image.new("L", (W, H), 0), lip.split()[3]))
+    layer.alpha_composite(lip)
+
+    img = Image.alpha_composite(img.convert("RGBA"), layer).convert("RGB")
+
+    # Faint accent bloom above the well, so the clock's colour tints its housing
+    if accent:
+        rr, gg, bb = to_rgb(accent)
+        bloom = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        ImageDraw.Draw(bloom).rounded_rectangle(
+            [x1 - s * 3, y1 - s * 3, x2 + s * 3, y2 + s * 3],
+            radius=wr, outline=(rr, gg, bb, 105), width=max(1, s * 2))
+        bloom = bloom.filter(ImageFilter.GaussianBlur(s * 3.5))
+        img = Image.alpha_composite(img.convert("RGBA"), bloom).convert("RGB")
+
+    return img.resize((w, h), Image.LANCZOS)
+
+
+# ---------------------------------------------------------------------------
+#  ClockWindow
+#
+#  One canvas for the whole widget.  Every piece of chrome is a canvas item on
+#  the chassis image, and the flip cards are embedded child canvases (nested so
+#  they clip their own digits).  Relayout moves items rather than destroying
+#  them, which is what makes live drag-resize cheap.
+# ---------------------------------------------------------------------------
+SNAP_PX = 9
+
+
+class ClockWindow(tk.Toplevel):
+
+    def __init__(self, master, cfg, ticker, on_close, on_edit, peers):
+        super().__init__(master)
+        self.cfg = cfg
+        self.ticker = ticker
+        self.on_close = on_close
+        self.on_edit = on_edit
+        self._peers = peers          # () -> other ClockWindows, for snapping
+
+        self._scale = float(cfg.get("scale", 1.0))
+        self._drag = None
+        self._resize = None
+        self._zone = None
+        self._zone_key = None
+        self._cards = {}
+        self._colons = []
+        self._last = {}
+        self._photo = None           # strong ref to the chassis image
+        self._colon_t0 = None
+        self._shown = {}             # last text pushed to each label item
+
+        self.overrideredirect(True)
+        self.configure(bg="#000000")
+        self.wm_attributes("-topmost", bool(cfg.get("topmost", True)))
+        self._apply_opacity()
+
+        self.cv = tk.Canvas(self, highlightthickness=0, bd=0, bg="#000000",
+                            takefocus=0)
+        self.cv.pack(fill="both", expand=True)
+        self._build()
+        self._place_initial()
+        self._bind()
+        self.ticker.subscribe(self)
+        self.on_second(time.time(), animate=False)
+
+    # -- config helpers ----------------------------------------------------
+    def _tc(self):
+        return self.cfg.get("text_color", "#ffffff")
+
+    def _cc(self):
+        return self.cfg.get("card_color", "#1e1e1e")
+
+    def _apply_opacity(self):
+        try:
+            self.wm_attributes("-alpha", float(self.cfg.get("opacity", 0.97)))
+        except tk.TclError:
+            pass
+
+    def zone(self):
+        """Cached ZoneInfo - it used to be reconstructed on every tick."""
+        key = self.cfg.get("tz", "UTC")
+        if key != self._zone_key:
+            try:
+                self._zone = zoneinfo.ZoneInfo(key)
+            except (zoneinfo.ZoneInfoNotFoundError, ValueError, OSError):
+                self._zone = datetime.timezone.utc
+            self._zone_key = key
+        return self._zone
+
+    # -- layout ------------------------------------------------------------
+    def _card_keys(self):
+        keys = ["h1", "h2", "m1", "m2"]
+        if self.cfg.get("show_seconds", True):
+            keys += ["s1", "s2"]
+        return keys
+
+    def _layout(self):
+        s = self._scale
+        L = {
+            # No outer mat: the panel runs to the window edge.  Any inset here
+            # shows up as a black border around the widget, because an
+            # overrideredirect Tk window has no transparency to blend into.
+            "pad": 0,
+            # Flush outer edge.  The resize grip in the bottom-right corner is
+            # square, so rounding the other three made that corner look broken.
+            # At radius 0 there is also no black left anywhere in the window.
+            "r": 0,
+            "wr": max(3, int(13 * s)),
+            "mx": max(8, int(14 * s)),
+            "my": max(6, int(10 * s)),
+            "hdr": max(16, int(26 * s)),
+            "ftr": max(14, int(22 * s)),
+            "gap": max(4, int(8 * s)),
+            "wp": max(4, int(10 * s)),
+            "cw": max(20, int(BASE_W * s)),
+            "ch": max(24, int(BASE_H * s)),
+            "cgap": max(2, int(5 * s)),
+            "colw": max(7, int(16 * s)),
+            "fs_lbl": max(9, int(13 * s)),
+            "fs_ftr": max(9, int(14 * s)),
+            "fs_col": max(14, int(52 * s)),
+            "handle": max(9, int(13 * s)),
+        }
+        seq = ["h1", "h2", ":", "m1", "m2"]
+        if self.cfg.get("show_seconds", True):
+            seq += [":", "s1", "s2"]
+        x, slots = 0, []
+        for i, k in enumerate(seq):
+            if i:
+                x += L["cgap"]
+            w = L["colw"] if k == ":" else L["cw"]
+            slots.append((k, x, w))
+            x += w
+        L["slots"] = slots
+        L["row_w"] = x
+
+        well_w = x + 2 * L["wp"]
+        well_h = L["ch"] + 2 * L["wp"]
+        panel_w = well_w + 2 * L["mx"]
+
+        # Header needs room for dot + label + two buttons
+        self._f_lbl.configure(size=-L["fs_lbl"])
+        hdr_need = int(L["mx"] * 2 + 14 * s + self._f_lbl.measure(self.cfg.get("label", "")) + 54 * s)
+        panel_w = max(panel_w, hdr_need)
+
+        panel_h = L["my"] * 2 + L["hdr"] + L["gap"] + well_h + L["gap"] + L["ftr"]
+        L["panel_w"], L["panel_h"] = panel_w, panel_h
+        L["w"] = panel_w + 2 * L["pad"]
+        L["h"] = panel_h + 2 * L["pad"]
+
+        wx = L["pad"] + (panel_w - well_w) // 2
+        wy = L["pad"] + L["my"] + L["hdr"] + L["gap"]
+        L["well"] = (wx, wy, wx + well_w, wy + well_h)
+        L["row_x"] = wx + L["wp"]
+        L["row_y"] = wy + L["wp"]
+        return L
+
+    # -- construction ------------------------------------------------------
+    def _build(self):
+        self._f_lbl = tkinter.font.Font(family=UI_FAMILY, size=-10, weight="bold")
+        L = self._layout()
+        cv = self.cv
+
+        self._bg = cv.create_image(0, 0, anchor="nw")
+        self._dot = cv.create_oval(0, 0, 0, 0, outline="", tags=("chrome",))
+        self._lbl = cv.create_text(0, 0, anchor="w", text="", tags=("chrome",))
+        self._btn_edit = cv.create_text(0, 0, anchor="center", text="✎",
+                                        tags=("chrome", "nodrag", "btn_edit"))
+        self._btn_close = cv.create_text(0, 0, anchor="center", text="✕",
+                                         tags=("chrome", "nodrag", "btn_close"))
+        self._date = cv.create_text(0, 0, anchor="w", text="", tags=("chrome",))
+        self._chip = cv.create_text(0, 0, anchor="e", text="", tags=("chrome",))
+        self._badge = cv.create_text(0, 0, anchor="e", text="", tags=("chrome",))
+        self._handle = cv.create_polygon(0, 0, 0, 0, 0, 0, outline="",
+                                         tags=("nodrag", "handle"))
+        self._sync_cards(L)
+        self._relayout(L)
+
+    def _sync_cards(self, L):
+        """Create or drop only the cards whose presence actually changed."""
+        want = self._card_keys()
+        for key in list(self._cards):
+            if key not in want:
+                self._cards.pop(key).destroy()
+                self._last.pop(key, None)
+        for key in want:
+            if key not in self._cards:
+                card = FlipCard(self.cv, self.ticker, self._tc(), self._cc(),
+                                self._scale)
+                self._bind_card(card)
+                self._cards[key] = card
+        n_colons = sum(1 for k, _, _ in L["slots"] if k == ":")
+        while len(self._colons) < n_colons:
+            self._colons.append(self.cv.create_text(0, 0, anchor="center",
+                                                    text=":", tags=("chrome",)))
+        while len(self._colons) > n_colons:
+            self.cv.delete(self._colons.pop())
+
+    def _relayout(self, L=None):
+        L = L or self._layout()
+        cv, s = self.cv, self._scale
         tc = self._tc()
 
-        # Header
-        self._bar = tk.Frame(self, bg="#0c0c0c", pady=5, padx=10)
-        self._bar.pack(fill="x")
-        tk.Label(self._bar, text="●", fg=tc, bg="#0c0c0c",
-                 font=("Segoe UI", 8)).pack(side="left")
-        self.lbl_city = tk.Label(self._bar, text=self.cfg.get("label",""),
-                                  fg=tc, bg="#0c0c0c",
-                                  font=("Segoe UI", 9, "bold"), padx=5)
-        self.lbl_city.pack(side="left")
-        tk.Button(self._bar, text="✕", command=self._close,
-                  bg="#0c0c0c", fg="#444444", relief="flat", bd=0,
-                  font=("Segoe UI", 9), cursor="hand2",
-                  activeforeground="#ff4444", padx=5).pack(side="right")
-        tk.Button(self._bar, text="✎", command=self._edit,
-                  bg="#0c0c0c", fg="#444444", relief="flat", bd=0,
-                  font=("Segoe UI", 9), cursor="hand2",
-                  activeforeground=tc, padx=5).pack(side="right")
+        self.geometry(f"{L['w']}x{L['h']}")
+        cv.configure(width=L["w"], height=L["h"])
 
-        # Cards
-        self._face = tk.Frame(self, bg="#000000", padx=10, pady=10)
-        self._face.pack()
-        self._row = tk.Frame(self._face, bg="#000000")
-        self._row.pack()
-        self.cards   = {}
-        self._colons = []
-        self._build_cards()
+        if HAS_PIL:
+            accent = tc if tc.lower() not in ("#ffffff", "#aaaaaa") else None
+            self._photo = ImageTk.PhotoImage(
+                render_chassis(L["w"], L["h"], L["pad"], L["r"], L["wr"],
+                               L["well"], accent))
+            cv.itemconfigure(self._bg, image=self._photo)
+        else:
+            cv.itemconfigure(self._bg, state="hidden")
+            cv.configure(bg=THEME["chassis"])
 
-        # Footer — Fix #4: bold, one tick larger
-        foot = tk.Frame(self, bg="#000000", padx=10, pady=4)
-        foot.pack(fill="x")
-        self.lbl_date = tk.Label(foot, text="", fg=tc, bg="#000000",
-                                  font=("Segoe UI", 11, "bold"))
-        self.lbl_date.pack(side="left")
-        self.lbl_tz = tk.Label(foot, text="", fg=tc, bg="#000000",
-                                font=("Segoe UI", 11, "bold"))
-        self.lbl_tz.pack(side="right")
+        hx = L["pad"] + L["mx"]
+        hy = L["pad"] + L["my"] + L["hdr"] // 2
+        dr = max(2, int(4 * s))
+        cv.coords(self._dot, hx, hy - dr, hx + 2 * dr, hy + dr)
+        cv.itemconfigure(self._dot, fill=tc)
+        cv.coords(self._lbl, hx + 3 * dr, hy)
+        cv.itemconfigure(self._lbl, text=self.cfg.get("label", ""), fill=tc,
+                         font=ui_font_px(L["fs_lbl"], "bold"))
 
-        # Corner resize handle — Fix #1: track from window top-left, not relx/rely
-        hc = tk.Canvas(self, width=HANDLE_PX, height=HANDLE_PX,
-                        bg="#000000", highlightthickness=0, cursor="size_nw_se")
-        hc.place(relx=1.0, rely=1.0, anchor="se")
-        hc.create_polygon(HANDLE_PX,0, HANDLE_PX,HANDLE_PX, 0,HANDLE_PX,
-                           fill="#2a2a2a", outline="")
-        hc.bind("<ButtonPress-1>",   self._rs_start)
-        hc.bind("<B1-Motion>",       self._rs_move)
-        hc.bind("<ButtonRelease-1>", self._rs_end)
-        self._handle = hc
+        bx = L["pad"] + L["panel_w"] - L["mx"]
+        bs = max(9, int(12 * s))
+        cv.coords(self._btn_close, bx - bs // 2, hy)
+        cv.coords(self._btn_edit, bx - bs * 2, hy)
+        for item in (self._btn_close, self._btn_edit):
+            cv.itemconfigure(item, fill=THEME["text_faint"], font=ui_font_px(bs))
 
-        self._blink_on = True
-        self._blink()
+        ci = 0
+        for key, ox, w in L["slots"]:
+            x = L["row_x"] + ox
+            if key == ":":
+                cv.coords(self._colons[ci], x + w // 2, L["row_y"] + L["ch"] // 2)
+                cv.itemconfigure(self._colons[ci], font=digit_font(L["fs_col"]),
+                                 fill=THEME["colon"])
+                ci += 1
+            else:
+                card = self._cards[key]
+                card.rescale(s)
+                if getattr(card, "_win", None) is None:
+                    card._win = cv.create_window(x, L["row_y"], anchor="nw",
+                                                 window=card)
+                else:
+                    cv.coords(card._win, x, L["row_y"])
 
-    def _build_cards(self):
-        for w in self._row.winfo_children():
-            w.destroy()
-        self.cards   = {}
-        self._colons = []
-        s  = self._scale
-        cf = max(14, int(38 * s))
-        px = max(2,  int(3  * s))
-        cy = max(4,  int(12 * s))
+        fy = L["pad"] + L["panel_h"] - L["my"] - L["ftr"] // 2
+        cv.coords(self._date, L["pad"] + L["mx"], fy)
+        cv.itemconfigure(self._date, fill=tc, font=ui_font_px(L["fs_ftr"], "bold"))
+        cv.coords(self._badge, bx, fy)
+        cv.itemconfigure(self._badge, font=ui_font_px(max(7, int(9 * s)), "bold"))
+        cv.coords(self._chip, bx, fy)
+        cv.itemconfigure(self._chip, fill=THEME["text_dim"],
+                         font=ui_font_px(L["fs_ftr"]))
 
-        def add_card(key):
-            fc = FlipCard(self._row, self._tc(), self._cc(), s)
-            fc.pack(side="left", padx=px)
-            self.cards[key] = fc
+        hp = L["handle"]
+        x2, y2 = L["w"] - L["pad"] - 2, L["h"] - L["pad"] - 2
+        cv.coords(self._handle, x2, y2 - hp, x2, y2, x2 - hp, y2)
+        cv.itemconfigure(self._handle, fill=lighten(THEME["chassis"], 0.16))
+        cv.tag_raise(self._handle)
+        self._L = L
+        self._refresh_footer()
 
-        def add_colon():
-            c = tk.Label(self._row, text=":", fg="#303030", bg="#000000",
-                         font=("Segoe UI", cf, "bold"))
-            c.pack(side="left", padx=max(2,int(4*s)), pady=(0,cy))
-            self._colons.append(c)
+    # -- binding -----------------------------------------------------------
+    def _bind(self):
+        cv = self.cv
+        cv.bind("<ButtonPress-1>", self._drag_start, add="+")
+        cv.bind("<B1-Motion>", self._drag_move, add="+")
+        cv.bind("<ButtonRelease-1>", self._drag_end, add="+")
+        cv.tag_bind("btn_edit", "<Button-1>", lambda e: self.on_edit(self))
+        cv.tag_bind("btn_close", "<Button-1>", lambda e: self.on_close(self))
+        for tag, hover in (("btn_edit", self._tc), ("btn_close", lambda: THEME["danger"])):
+            cv.tag_bind(tag, "<Enter>",
+                        lambda e, t=tag, h=hover: cv.itemconfigure(t, fill=h()))
+            cv.tag_bind(tag, "<Leave>",
+                        lambda e, t=tag: cv.itemconfigure(t, fill=THEME["text_faint"]))
+        cv.tag_bind("handle", "<ButtonPress-1>", self._rs_start)
+        cv.tag_bind("handle", "<B1-Motion>", self._rs_move)
+        cv.tag_bind("handle", "<ButtonRelease-1>", self._rs_end)
+        cv.tag_bind("handle", "<Enter>",
+                    lambda e: cv.configure(cursor="size_nw_se"))
+        cv.tag_bind("handle", "<Leave>", lambda e: cv.configure(cursor=""))
 
-        for k in ("h1","h2"): add_card(k)
-        add_colon()
-        for k in ("m1","m2"): add_card(k)
-        add_colon()
-        for k in ("s1","s2"): add_card(k)
+    def _bind_card(self, card):
+        """Cards are separate widgets, so events do not reach the chassis.
 
-        for key, d in self._prev.items():
-            if key in self.cards:
-                self.cards[key]._cur = d
-                self.cards[key]._draw_static(d)
+        Bound exactly once at creation - the old recursive rebinder re-applied
+        `add="+"` handlers on every rebuild and stacked duplicates.
+        """
+        card.bind("<ButtonPress-1>", self._drag_start, add="+")
+        card.bind("<B1-Motion>", self._drag_move, add="+")
+        card.bind("<ButtonRelease-1>", self._drag_end, add="+")
 
-        self._bind_drag(self._row)
+    def _on_nodrag(self, event):
+        if event.widget is not self.cv:
+            return False
+        cur = self.cv.find_withtag("current")
+        return bool(cur) and "nodrag" in self.cv.gettags(cur[0])
 
-    def _blink(self):
-        if not self.winfo_exists(): return
-        c = "#484848" if self._blink_on else "#1c1c1c"
-        for col in self._colons:
-            try: col.config(fg=c)
-            except: pass
-        self._blink_on = not self._blink_on
-        self.after(500, self._blink)
-
-    # ── Window drag ───────────────────────────────────────────────────────────
-    def _bind_drag(self, w):
-        w.bind("<ButtonPress-1>",   self._ds, add="+")
-        w.bind("<B1-Motion>",       self._dm, add="+")
-        w.bind("<ButtonRelease-1>", self._de, add="+")
-        for c in w.winfo_children():
-            self._bind_drag(c)
-
-    def _ds(self, e):
-        if e.widget is self._handle: return
+    # -- move / snap -------------------------------------------------------
+    def _drag_start(self, e):
+        if self._on_nodrag(e):
+            return
         self._drag = (e.x_root - self.winfo_x(), e.y_root - self.winfo_y())
 
-    def _dm(self, e):
-        if self._drag:
-            self.geometry(f"+{e.x_root-self._drag[0]}+{e.y_root-self._drag[1]}")
+    def _drag_move(self, e):
+        if not self._drag:
+            return
+        x, y = e.x_root - self._drag[0], e.y_root - self._drag[1]
+        if not (e.state & 0x0001):        # hold Shift to place freely
+            x, y = self._snap(x, y)
+        self.geometry(f"+{x}+{y}")
 
-    def _de(self, e):
+    def _drag_end(self, e):
         if self._drag:
-            self.cfg["x"] = self.winfo_x()
-            self.cfg["y"] = self.winfo_y()
+            self.cfg["x"], self.cfg["y"] = self.winfo_x(), self.winfo_y()
         self._drag = None
 
-    # ── Corner resize ────────────────────────────────────────────────────────
-    # Strategy: window top-left is FIXED. The cursor drags the bottom-right
-    # corner. Scale is derived directly from (mouse_x - window_left) so the
-    # handle tracks the cursor with no repositioning arithmetic needed.
+    def _snap(self, x, y):
+        """Pull to screen edges and to the edges of sibling clocks."""
+        w, h = self.winfo_width(), self.winfo_height()
+        xs = [0, self.winfo_screenwidth() - w]
+        ys = [0, self.winfo_screenheight() - h]
+        for p in self._peers():
+            if p is self:
+                continue
+            try:
+                if not p.winfo_exists():
+                    continue
+                px, py = p.winfo_x(), p.winfo_y()
+                pw, ph = p.winfo_width(), p.winfo_height()
+            except tk.TclError:
+                continue
+            xs += [px, px + pw - w, px + pw, px - w]
+            ys += [py, py + ph - h, py + ph, py - h]
+        for c in xs:
+            if abs(x - c) <= SNAP_PX:
+                x = c
+                break
+        for c in ys:
+            if abs(y - c) <= SNAP_PX:
+                y = c
+                break
+        return x, y
+
+    def _place_initial(self):
+        self.update_idletasks()
+        x, y = clamp_to_screen(self.cfg.get("x", 100), self.cfg.get("y", 100),
+                               self.winfo_reqwidth(), self.winfo_reqheight(),
+                               self.winfo_screenwidth(), self.winfo_screenheight())
+        self.cfg["x"], self.cfg["y"] = x, y
+        self.geometry(f"+{x}+{y}")
+
+    def recall(self, x=40, y=40):
+        """Bring a clock that ended up off-screen back into view.
+
+        Order matters: on an overrideredirect window, setting -topmost after a
+        move re-asserts the previous geometry and silently discards it, so the
+        position has to be applied last.
+        """
+        self.update_idletasks()
+        self.geometry(f"+{x}+{y}")
+        self.update_idletasks()
+        if (self.winfo_x(), self.winfo_y()) != (x, y):
+            # Some window managers ignore a position-only request; restate it
+            # with the size included.
+            self.geometry(f"{self.winfo_width()}x{self.winfo_height()}+{x}+{y}")
+        self.cfg["x"], self.cfg["y"] = x, y
+        # Raise in a later pass.  lift() and -topmost both re-assert this
+        # window's cached geometry on an overrideredirect window, which would
+        # replay the old position straight over the move we just made.
+        self.after(0, self._raise_self)
+
+    def _raise_self(self):
+        try:
+            self.wm_attributes("-topmost", bool(self.cfg.get("topmost", True)))
+            self.lift()
+        except tk.TclError:
+            pass
+
+    # -- resize ------------------------------------------------------------
     def _rs_start(self, e):
         self._drag = None
         self.update_idletasks()
-        # Natural window width at current scale — used to derive pixels-per-unit
-        win_w = self.winfo_width()
-        self._resize = (
-            self.winfo_x(),   # window left — stays fixed throughout
-            self.winfo_y(),   # window top  — stays fixed throughout
-            self._scale,       # scale at drag start
-            win_w,             # window width at drag start
-            e.x_root,         # mouse x at drag start
-        )
+        self._resize = (self.winfo_x(), self.winfo_y(), self._scale,
+                        max(1, self.winfo_width()), e.x_root)
 
     def _rs_move(self, e):
-        if not self._resize: return
+        if not self._resize:
+            return
         wx, wy, s0, w0, rx0 = self._resize
-        # How far the cursor has moved from drag-start
-        dx = e.x_root - rx0
-        # Derive new scale: width grows by dx, each pixel = s0/w0 scale units
-        new_scale = round(max(SCALE_MIN, min(SCALE_MAX, s0 + dx * s0 / w0)), 2)
-        if abs(new_scale - self._scale) >= 0.01:
-            self._scale = new_scale
-            for fc in self.cards.values():
-                fc.rebuild(new_scale)
-            cf = max(14, int(38 * new_scale))
-            cy = max(4,  int(12 * new_scale))
-            px = max(2,  int(3  * new_scale))
-            for c in self._colons:
-                c.config(font=("Segoe UI", cf, "bold"))
-                c.pack_configure(padx=max(2, int(4 * new_scale)), pady=(0, cy))
-            for fc in self.cards.values():
-                fc.pack_configure(padx=px)
-            # Keep window pinned at its original top-left
+        new = round(max(SCALE_MIN, min(SCALE_MAX, s0 + (e.x_root - rx0) * s0 / w0)), 2)
+        if abs(new - self._scale) >= 0.02:
+            self._scale = new
+            self._relayout()          # in place: no widgets destroyed
             self.geometry(f"+{wx}+{wy}")
 
     def _rs_end(self, e):
         if self._resize:
             self.cfg["scale"] = self._scale
-            self.cfg["x"] = self.winfo_x()
-            self.cfg["y"] = self.winfo_y()
-            self._build_cards()
-            self._handle.place(relx=1.0, rely=1.0, anchor="se")
+            self.cfg["x"], self.cfg["y"] = self.winfo_x(), self.winfo_y()
         self._resize = None
 
-    def _close(self): self.on_close(self)
-    def _edit(self):  self.on_edit(self)
+    # -- time --------------------------------------------------------------
+    def on_second(self, _ts, animate=True):
+        now = datetime.datetime.now(self.zone())
+        hh = now.strftime("%H" if self.cfg.get("hour24", True) else "%I")
+        mm, ss = now.strftime("%M"), now.strftime("%S")
+        digits = {"h1": hh[0], "h2": hh[1], "m1": mm[0], "m2": mm[1],
+                  "s1": ss[0], "s2": ss[1]}
+        for key, card in self._cards.items():
+            d = digits[key]
+            if self._last.get(key) != d:
+                card.set(d) if animate else card.set_immediate(d)
+                self._last[key] = d
+        self._refresh_footer(now)
+        if animate and self._colons:
+            self._colon_t0 = time.perf_counter()
+            self.ticker.animate(self)
 
-    def _tick(self):
-        if not self.winfo_exists(): return
-        try:
-            tz  = zoneinfo.ZoneInfo(self.cfg["tz"])
-            now = datetime.datetime.now(tz)
-            h, m, s = now.strftime("%H"), now.strftime("%M"), now.strftime("%S")
-            for key, d in [("h1",h[0]),("h2",h[1]),
-                           ("m1",m[0]),("m2",m[1]),
-                           ("s1",s[0]),("s2",s[1])]:
-                if self._prev.get(key) != d:
-                    self.cards[key].set(d)
-                    self._prev[key] = d
-            self.lbl_date.config(text=now.strftime("%a  %b %d  %Y"))
-            self.lbl_tz.config(text=self.cfg.get("label", self.cfg["tz"]))
-        except Exception as ex:
-            try: self.lbl_date.config(text=str(ex)[:50])
-            except: pass
-        self.after(250, self._tick)
+    def _set_text(self, item, text):
+        """Only touch the canvas when the string actually changed."""
+        if self._shown.get(item) != text:
+            self.cv.itemconfigure(item, text=text)
+            self._shown[item] = text
 
+    def _refresh_footer(self, now=None):
+        now = now or datetime.datetime.now(self.zone())
+        self._set_text(self._date, now.strftime("%a  %b %d  %Y"))
+
+        chip = utc_offset_label(now)
+        if not self.cfg.get("hour24", True):
+            chip = f"{now.strftime('%p')}  ·  {chip}"
+        badge = day_offset_label(now)
+        self._set_text(self._badge, badge)
+        self.cv.itemconfigure(self._badge, fill=self._tc())
+
+        bx = self._L["pad"] + self._L["panel_w"] - self._L["mx"]
+        pad = self._f_lbl.measure("  " + badge) if badge else 0
+        self.cv.coords(self._chip, bx - pad, self.cv.coords(self._chip)[1])
+        self._set_text(self._chip, chip)
+
+    def step(self, now):
+        """Colon fade, pulsed once per second off the shared frame loop."""
+        if self._colon_t0 is None:
+            return False
+        t = (now - self._colon_t0) / 0.55
+        if t >= 1.0:
+            self._colon_t0 = None
+            col = THEME["colon_dim"]
+            done = True
+        else:
+            col = lerp(THEME["colon_dim"], THEME["colon"],
+                       quantise(1.0 - smoothstep(t)))
+            done = False
+        for c in self._colons:
+            self.cv.itemconfigure(c, fill=col)
+        return not done
+
+    # -- style -------------------------------------------------------------
     def refresh_style(self):
-        tc = self._tc()
-        self.lbl_city.config(text=self.cfg.get("label",""), fg=tc)
-        self.lbl_date.config(fg=tc)
-        self.lbl_tz.config(fg=tc)
-        self._build_cards()
+        self._apply_opacity()
+        self.wm_attributes("-topmost", bool(self.cfg.get("topmost", True)))
+        self._scale = float(self.cfg.get("scale", self._scale))
+        self._zone_key = None
+        L = self._layout()
+        self._sync_cards(L)
+        for card in self._cards.values():
+            card.update_style(self._tc(), self._cc())
+        self._last.clear()
+        self._shown.clear()
+        self._relayout(L)
+        self.on_second(time.time(), animate=False)
+
+    def destroy(self):
+        self.ticker.unsubscribe(self)
+        super().destroy()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  SwatchPicker
-# ─────────────────────────────────────────────────────────────────────────────
+def utc_offset_label(dt):
+    """'GMT+9', 'GMT-3:30', 'GMT' - what a world clock is actually for."""
+    off = dt.utcoffset()
+    if off is None:
+        return "GMT"
+    total = int(off.total_seconds()) // 60
+    sign = "-" if total < 0 else "+"
+    hh, mm = divmod(abs(total), 60)
+    if not hh and not mm:
+        return "GMT"
+    return f"GMT{sign}{hh}" + (f":{mm:02d}" if mm else "")
+
+
+def day_offset_label(dt, local_now=None):
+    """'+1' / '-1' when that timezone is on a different calendar day."""
+    local = local_now or datetime.datetime.now()
+    delta = (dt.date() - local.date()).days
+    if delta > 0:
+        return "+1"
+    if delta < 0:
+        return "-1"
+    return ""
+
+
+# ---------------------------------------------------------------------------
+#  Shared widgets
+# ---------------------------------------------------------------------------
+# fill, text, hover fill, hover text.  Entries are THEME keys, or literal
+# colours that pass straight through.
+_BTN_STYLES = {
+    "primary": ("accent", "#ffffff", "accent_hi", "#ffffff"),
+    "ghost": ("surface", "text_dim", "surface_hi", "text"),
+    "danger": ("surface", "text_dim", "danger", "#ffffff"),
+    "flat": ("bg", "text_faint", "surface", "text"),
+}
+
+
+class SurfaceButton(tk.Canvas):
+    """A button drawn with render_surface, so it matches the flip cards.
+
+    Tk's own Button is a flat colour block with no way to carry a gradient, a
+    specular edge or a bevel, which is why the manager never looked related to
+    the widgets it manages.
+    """
+
+    def __init__(self, parent, text, command, kind="ghost", font=None,
+                 padx=14, pady=8, width=None, height=None, behind=None,
+                 radius=9, **kw):
+        self._fill, self._fg, self._hover_fill, self._hover_fg = (
+            THEME.get(v, v) for v in _BTN_STYLES[kind])
+        self._behind = behind or THEME["bg"]
+        self._radius = radius
+        self._command = command
+        self._font = font or ui_font(10)
+        self._enabled = True
+        self._state = "normal"
+        self._photos = {}            # strong refs; a collected one blanks the button
+
+        f = tkinter.font.Font(font=self._font)
+        w = width or f.measure(text) + padx * 2
+        h = height or f.metrics("linespace") + pady * 2
+        super().__init__(parent, width=w, height=h, highlightthickness=0, bd=0,
+                         bg=self._behind, takefocus=0, cursor="hand2", **kw)
+        self._cw, self._ch = w, h   # not _w: Tk stores the widget path there
+        self._img = self.create_image(0, 0, anchor="nw")
+        self._txt = self.create_text(w // 2, h // 2, text=text, font=self._font,
+                                     fill=self._fg, anchor="center")
+        self._paint("normal")
+
+        self.bind("<Enter>", lambda e: self._paint("hover"))
+        self.bind("<Leave>", lambda e: self._paint("normal"))
+        self.bind("<ButtonPress-1>", lambda e: self._paint("pressed"))
+        self.bind("<ButtonRelease-1>", self._release)
+        self.bind("<Configure>", self._on_configure)
+
+    # -- painting ----------------------------------------------------------
+    def _paint(self, state):
+        if not self._enabled:
+            state = "normal"
+        self._state = state
+        if HAS_PIL:
+            key = (state, self._cw, self._ch)
+            photo = self._photos.get(key)
+            if photo is None:
+                fill = self._hover_fill if state == "hover" else self._fill
+                photo = ImageTk.PhotoImage(render_surface(
+                    self._cw, self._ch, self._radius, fill, self._behind,
+                    inset=(state == "pressed")))
+                self._photos[key] = photo
+            self.itemconfigure(self._img, image=photo, state="normal")
+        else:
+            self.configure(bg=self._hover_fill if state == "hover" else self._fill)
+        fg = self._hover_fg if state == "hover" else self._fg
+        if not self._enabled:
+            fg = THEME["text_faint"]
+        self.itemconfigure(self._txt, fill=fg)
+
+    def _on_configure(self, e):
+        # Re-render only on a real size change; reacting to every event would
+        # loop, because painting can itself trigger <Configure>.
+        if (e.width, e.height) == (self._cw, self._ch):
+            return
+        self._cw, self._ch = e.width, e.height
+        self._photos.clear()
+        self.coords(self._txt, self._cw // 2, self._ch // 2)
+        self._paint(self._state)
+
+    def _release(self, e):
+        inside = 0 <= e.x < self._cw and 0 <= e.y < self._ch
+        self._paint("hover" if inside else "normal")
+        if inside and self._enabled and self._command:
+            self._command()
+
+    # -- public ------------------------------------------------------------
+    def set_text(self, text):
+        self.itemconfigure(self._txt, text=text)
+
+    def set_enabled(self, enabled):
+        self._enabled = bool(enabled)
+        self.configure(cursor="hand2" if enabled else "")
+        self._paint("normal")
+
+
+def make_button(parent, text, command, kind="ghost", **kw):
+    return SurfaceButton(parent, text, command, kind=kind, **kw)
+
+
+class ToggleSwitch(tk.Canvas):
+    """An on/off switch: inset track, raised knob, short slide between them."""
+
+    W, H = 46, 26
+    DURATION = 0.13
+
+    def __init__(self, parent, variable, command=None, behind=None, **kw):
+        self.var = variable
+        self._command = command
+        self._behind = behind or THEME["surface"]
+        self._enabled = True
+        self._pos = 1.0 if variable.get() else 0.0
+        self._target = self._pos
+        self._t0 = None
+        self._job = None
+        self._photos = {}
+        super().__init__(parent, width=self.W, height=self.H, bd=0,
+                         highlightthickness=0, bg=self._behind, takefocus=0,
+                         cursor="hand2", **kw)
+        self._track = self.create_image(0, 0, anchor="nw")
+        self._knob = self.create_image(0, 0, anchor="nw")
+        self.bind("<Button-1>", self._clicked)
+        self._trace = variable.trace_add("write", lambda *_: self._sync())
+        self.bind("<Destroy>", self._teardown)
+        self._draw()
+
+    def _teardown(self, _=None):
+        """Drop the pending frame and the variable trace.
+
+        winfo_exists() inside the callback is not enough: destroying the widget
+        deletes the Tcl command behind it, so a queued `after` fires against a
+        name that no longer resolves and Tk reports a background error.
+        """
+        if self._job is not None:
+            try:
+                self.after_cancel(self._job)
+            except tk.TclError:
+                pass
+            self._job = None
+        if self._trace is not None:
+            try:
+                self.var.trace_remove("write", self._trace)
+            except (tk.TclError, ValueError):
+                pass
+            self._trace = None
+
+    def _photo(self, key, *args, **kwargs):
+        photo = self._photos.get(key)
+        if photo is None:
+            photo = ImageTk.PhotoImage(render_surface(*args, **kwargs))
+            self._photos[key] = photo
+        return photo
+
+    def _draw(self):
+        if not HAS_PIL:
+            self.configure(bg=THEME["accent"] if self.var.get() else THEME["surface_hi"])
+            return
+        on = THEME["accent"] if self._enabled else THEME["surface_hi"]
+        fill = lerp(THEME["well"], on, quantise(self._pos))
+        self.itemconfigure(self._track, image=self._photo(
+            ("track", fill), self.W, self.H, self.H // 2, fill, self._behind,
+            inset=True, strength=0.7))
+        d = self.H - 8
+        knob = THEME["text"] if self._enabled else THEME["text_faint"]
+        self.itemconfigure(self._knob, image=self._photo(
+            ("knob", knob), d, d, d // 2, knob, fill, strength=0.55))
+        self.coords(self._knob, 4 + int((self.W - d - 8) * self._pos), 4)
+
+    def _clicked(self, _):
+        if not self._enabled:
+            return
+        self.var.set(not self.var.get())
+        if self._command:
+            self._command()
+
+    def _sync(self):
+        self._target = 1.0 if self.var.get() else 0.0
+        if abs(self._target - self._pos) < 0.01:
+            return
+        self._t0 = time.perf_counter()
+        self._start = self._pos
+        if self._job is None:
+            self._animate()
+
+    def _animate(self):
+        self._job = None
+        if not self.winfo_exists():
+            return
+        t = (time.perf_counter() - self._t0) / self.DURATION
+        if t >= 1.0:
+            self._pos = self._target
+            self._draw()
+            return
+        self._pos = self._start + (self._target - self._start) * smoothstep(t)
+        self._draw()
+        self._job = self.after(FRAME_MS, self._animate)
+
+    def set_enabled(self, enabled):
+        self._enabled = bool(enabled)
+        self.configure(cursor="hand2" if enabled else "")
+        self._photos.clear()
+        self._draw()
+
+
+def entry_style():
+    return dict(bg=THEME["surface"], fg=THEME["text"],
+                insertbackground=THEME["text"], relief="flat",
+                highlightthickness=1, highlightbackground=THEME["divider"],
+                highlightcolor=THEME["accent"], font=ui_font(11))
+
+
+class ScrollFrame(tk.Frame):
+    """Vertically scrollable container. `body` is the frame to fill."""
+
+    def __init__(self, parent, height=250, bg=None, **kw):
+        bg = bg or THEME["bg"]
+        self._bg = bg
+        super().__init__(parent, bg=bg, **kw)
+        self._cv = tk.Canvas(self, bg=bg, highlightthickness=0, bd=0,
+                             height=height, takefocus=0)
+        self._sb = tk.Scrollbar(self, orient="vertical", command=self._cv.yview,
+                                relief="flat", bd=0, width=10,
+                                bg=THEME["surface"], troughcolor=bg,
+                                activebackground=THEME["surface_hi"])
+        self._cv.configure(yscrollcommand=self._on_scroll)
+        self._cv.pack(side="left", fill="both", expand=True)
+        self.body = tk.Frame(self._cv, bg=bg)
+        self._win = self._cv.create_window(0, 0, anchor="nw", window=self.body)
+        self.body.bind("<Configure>", self._resize)
+        self._cv.bind("<Configure>",
+                      lambda e: self._cv.itemconfigure(self._win, width=e.width))
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self._cv.bind_all(seq, self._wheel, add="+")
+
+    def _on_scroll(self, lo, hi):
+        # Only show the scrollbar when there is something to scroll to
+        if float(lo) <= 0.0 and float(hi) >= 1.0:
+            self._sb.pack_forget()
+        else:
+            self._sb.pack(side="right", fill="y")
+        self._sb.set(lo, hi)
+
+    def _resize(self, _):
+        self._cv.configure(scrollregion=self._cv.bbox("all"))
+
+    def _wheel(self, e):
+        try:
+            if not self.winfo_ismapped():
+                return
+        except tk.TclError:
+            return
+        delta = -1 if getattr(e, "num", 0) == 5 or getattr(e, "delta", 0) < 0 else 1
+        self._cv.yview_scroll(-delta, "units")
+
+
 class SwatchPicker(tk.Frame):
     COLS = 6
 
     def __init__(self, parent, variable, **kw):
-        super().__init__(parent, bg="#0d0d0d", **kw)
+        super().__init__(parent, bg=THEME["bg"], **kw)
         self.var = variable
+        self._tip = None
+        self._holders = {}
         for i, (color, name) in enumerate(PALETTE):
-            light = color in ("#ffffff","#ffd700","#aaaaaa")
-            sel   = "#000000" if light else "#ffffff"
-            rb = tk.Radiobutton(self, variable=variable, value=color,
+            # A Radiobutton with indicatoron=False paints `selectcolor` over its
+            # background when chosen, so the white swatch used to turn black the
+            # moment it was selected.  Keep the swatch its own colour and show
+            # selection with the surrounding holder instead.
+            holder = tk.Frame(self, bg=THEME["divider"], padx=2, pady=2)
+            holder.grid(row=i // self.COLS, column=i % self.COLS, padx=3, pady=3)
+            rb = tk.Radiobutton(holder, variable=variable, value=color,
                                 bg=color, activebackground=color,
-                                selectcolor=sel,
-                                indicatoron=False, relief="flat", bd=2,
-                                width=3, height=1, cursor="hand2")
-            rb.grid(row=i // self.COLS, column=i % self.COLS, padx=3, pady=3)
+                                selectcolor=color, indicatoron=False,
+                                relief="flat", bd=0, width=3, height=1,
+                                cursor="hand2", highlightthickness=0)
+            rb.pack()
+            self._holders[color] = holder
             self._tooltip(rb, name)
+        variable.trace_add("write", self._sync)
+        self._sync()
+
+    def _sync(self, *_):
+        cur = self.var.get()
+        for color, holder in self._holders.items():
+            try:
+                holder.configure(bg=THEME["accent"] if color == cur else THEME["divider"])
+            except tk.TclError:
+                pass
 
     def _tooltip(self, widget, text):
         def show(e):
-            self._tip = tk.Label(self.winfo_toplevel(), text=text,
-                                  bg="#333333", fg="#ffffff",
-                                  font=("Segoe UI", 8), padx=4, pady=2)
-            rx = e.x_root - self.winfo_toplevel().winfo_rootx()
-            ry = e.y_root - self.winfo_toplevel().winfo_rooty()
-            self._tip.place(x=rx+10, y=ry+10)
-        def hide(e):
-            if hasattr(self, "_tip"):
-                try: self._tip.destroy()
-                except: pass
+            hide(e)
+            top = self.winfo_toplevel()
+            self._tip = tk.Label(top, text=text, bg=THEME["surface_hi"],
+                                 fg=THEME["text"], font=ui_font(8),
+                                 padx=5, pady=2)
+            self._tip.place(x=e.x_root - top.winfo_rootx() + 12,
+                            y=e.y_root - top.winfo_rooty() + 14)
+
+        def hide(_):
+            if self._tip is not None:
+                try:
+                    self._tip.destroy()
+                except tk.TclError:
+                    pass
+                self._tip = None
+
         widget.bind("<Enter>", show)
         widget.bind("<Leave>", hide)
+        widget.bind("<Destroy>", hide)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 #  EditDialog
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 class EditDialog(tk.Toplevel):
+
     def __init__(self, master, cfg, on_save):
         super().__init__(master)
-        self.cfg     = cfg
+        self.cfg = cfg
         self.on_save = on_save
-        self.title("Edit Clock")
-        self.configure(bg="#0d0d0d")
-        self.resizable(False, False)
-        self.wm_attributes("-topmost", True)
-        self.grab_set()
         self._user_edited_label = False
+        self._syncing = False
+        self.title("Edit Clock")
+        self.configure(bg=THEME["bg"])
+        self.resizable(False, False)
+        self.transient(master)
+        apply_window_icon(self)
         self._build()
+        self.bind("<Return>", lambda e: self._save())
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.update_idletasks()
+        self._centre_on(master)
+        self.grab_set()
+        self.e_lbl.focus_set()
+
+    def _centre_on(self, master):
+        try:
+            mx, my = master.winfo_rootx(), master.winfo_rooty()
+            mw, mh = master.winfo_width(), master.winfo_height()
+            if mw <= 1:
+                raise tk.TclError
+        except tk.TclError:
+            mx = my = 0
+            mw, mh = self.winfo_screenwidth(), self.winfo_screenheight()
+        x = mx + (mw - self.winfo_width()) // 2
+        y = my + (mh - self.winfo_height()) // 2
+        x, y = clamp_to_screen(x, y, self.winfo_width(), self.winfo_height(),
+                               self.winfo_screenwidth(), self.winfo_screenheight())
+        self.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+    def _row_label(self, text, row, sticky="w"):
+        tk.Label(self, text=text, bg=THEME["bg"], fg=THEME["text_dim"],
+                 font=ui_font(11)).grid(row=row, column=0, sticky=sticky,
+                                        padx=16, pady=8)
 
     def _build(self):
-        P   = dict(padx=16, pady=9)
-        LBL = dict(bg="#0d0d0d", fg="#888888", font=("Segoe UI", 11))
-        ENT = dict(bg="#1c1c1c", fg="#ffffff", insertbackground="#ffffff",
-                   font=("Segoe UI", 11), relief="flat",
-                   highlightbackground="#333333", highlightthickness=1)
+        P = dict(padx=16, pady=8)
 
-        tk.Label(self, text="Label", **LBL).grid(row=0, column=0, sticky="w", **P)
-        self.e_lbl = tk.Entry(self, **ENT, width=26)
-        self.e_lbl.insert(0, self.cfg.get("label",""))
-        self.e_lbl.grid(row=0, column=1, **P, sticky="ew")
+        self._row_label("Label", 0)
+        self.e_lbl = tk.Entry(self, width=26, **entry_style())
+        self.e_lbl.insert(0, self.cfg.get("label", ""))
+        self.e_lbl.grid(row=0, column=1, sticky="ew", **P)
         self.e_lbl.bind("<Key>", lambda e: setattr(self, "_user_edited_label", True))
 
-        tk.Label(self, text="Timezone", **LBL).grid(row=1, column=0, sticky="nw", **P)
-        tz_f = tk.Frame(self, bg="#0d0d0d")
-        tz_f.grid(row=1, column=1, **P, sticky="ew")
+        self._row_label("Timezone", 1, "nw")
+        tzf = tk.Frame(self, bg=THEME["bg"])
+        tzf.grid(row=1, column=1, sticky="ew", **P)
         self.sv = tk.StringVar()
-        self.sv.trace("w", self._on_tz_change)
-        tk.Entry(tz_f, textvariable=self.sv, **ENT, width=32).pack(fill="x")
-        self.sv.set(self.cfg.get("tz","UTC"))
+        tk.Entry(tzf, textvariable=self.sv, width=32, **entry_style()).pack(fill="x")
+        self.sv.trace_add("write", self._on_tz_change)
 
-        lb_wrap = tk.Frame(tz_f, bg="#1c1c1c")
-        lb_wrap.pack(fill="both", expand=True, pady=(2,0))
-        sb = tk.Scrollbar(lb_wrap, orient="vertical", bg="#0d0d0d", troughcolor="#0d0d0d")
+        wrap = tk.Frame(tzf, bg=THEME["surface"])
+        wrap.pack(fill="both", expand=True, pady=(3, 0))
+        sb = tk.Scrollbar(wrap, orient="vertical", relief="flat", bd=0, width=10,
+                          bg=THEME["surface"], troughcolor=THEME["bg"],
+                          activebackground=THEME["surface_hi"])
         sb.pack(side="right", fill="y")
-        self.lb = tk.Listbox(lb_wrap, bg="#1c1c1c", fg="#aaaaaa",
-                              selectbackground="#1e3a5f", selectforeground="#ffffff",
-                              font=("Segoe UI",10), relief="flat", height=7,
-                              yscrollcommand=sb.set, activestyle="none", bd=0)
+        self.lb = tk.Listbox(wrap, bg=THEME["surface"], fg=THEME["text_dim"],
+                             selectbackground=THEME["accent"],
+                             selectforeground="#ffffff", font=ui_font(10),
+                             relief="flat", height=7, yscrollcommand=sb.set,
+                             activestyle="none", bd=0, highlightthickness=0)
         self.lb.pack(fill="both", expand=True)
         sb.config(command=self.lb.yview)
         self._populate(ALL_ZONES)
         self.lb.bind("<<ListboxSelect>>", self._on_lb_select)
+        self.sv.set(self.cfg.get("tz", "UTC"))
 
-        tk.Label(self, text="Text Color", **LBL).grid(row=2, column=0, sticky="nw", **P)
-        self.tcv = tk.StringVar(value=self.cfg.get("text_color","#ffffff"))
-        SwatchPicker(self, self.tcv).grid(row=2, column=1, **P, sticky="w")
+        self._row_label("Look", 2, "nw")
+        pf = tk.Frame(self, bg=THEME["bg"])
+        pf.grid(row=2, column=1, sticky="w", **P)
+        for i, (name, tc, cc) in enumerate(PRESETS):
+            make_button(pf, name, lambda t=tc, c=cc: self._apply_preset(t, c),
+                        kind="ghost", font=ui_font(9), padx=8, pady=4
+                        ).grid(row=i // 4, column=i % 4, padx=2, pady=2, sticky="ew")
 
-        tk.Label(self, text="Card Color", **LBL).grid(row=3, column=0, sticky="nw", **P)
-        self.ccv = tk.StringVar(value=self.cfg.get("card_color","#1e1e1e"))
-        SwatchPicker(self, self.ccv).grid(row=3, column=1, **P, sticky="w")
+        self._row_label("Text Colour", 3, "nw")
+        self.tcv = tk.StringVar(value=self.cfg.get("text_color", "#ffffff"))
+        SwatchPicker(self, self.tcv).grid(row=3, column=1, sticky="w", **P)
 
-        def match_card():
-            self.ccv.set(PAL_DARK.get(self.tcv.get(), "#1e1e1e"))
-        tk.Button(self, text="Auto-match card colour →", command=match_card,
-                  bg="#1a1a1a", fg="#888888", font=("Segoe UI",9),
-                  relief="flat", pady=3, cursor="hand2",
-                  activeforeground="#ffffff"
-                  ).grid(row=4, column=1, padx=16, pady=(0,6), sticky="w")
+        self._row_label("Card Colour", 4, "nw")
+        self.ccv = tk.StringVar(value=self.cfg.get("card_color", "#1e1e1e"))
+        SwatchPicker(self, self.ccv).grid(row=4, column=1, sticky="w", **P)
+        make_button(self, "Match card to text colour",
+                    lambda: self.ccv.set(PAL_DARK.get(self.tcv.get(), "#1e1e1e")),
+                    kind="flat", font=ui_font(9), padx=8, pady=3
+                    ).grid(row=5, column=1, sticky="w", padx=16, pady=(0, 6))
 
-        bf = tk.Frame(self, bg="#0d0d0d")
-        bf.grid(row=5, column=0, columnspan=2, pady=14)
-        tk.Button(bf, text="  Save  ", command=self._save,
-                  bg="#1e3a5f", fg="#ffffff", font=("Segoe UI",10,"bold"),
-                  relief="flat", padx=18, pady=7, cursor="hand2",
-                  activebackground="#2a4a7f").pack(side="left", padx=6)
-        tk.Button(bf, text="Cancel", command=self.destroy,
-                  bg="#0d0d0d", fg="#666666", font=("Segoe UI",10),
-                  relief="flat", padx=18, pady=7, cursor="hand2").pack(side="left", padx=6)
+        self._row_label("Display", 6, "nw")
+        of = tk.Frame(self, bg=THEME["bg"])
+        of.grid(row=6, column=1, sticky="w", **P)
+        self.v24 = tk.BooleanVar(value=self.cfg.get("hour24", True))
+        self.vsec = tk.BooleanVar(value=self.cfg.get("show_seconds", True))
+        self.vtop = tk.BooleanVar(value=self.cfg.get("topmost", True))
+        for i, (txt, var) in enumerate((("24-hour clock", self.v24),
+                                        ("Show seconds", self.vsec),
+                                        ("Always on top", self.vtop))):
+            tk.Checkbutton(of, text=txt, variable=var, bg=THEME["bg"],
+                           fg=THEME["text_dim"], selectcolor=THEME["surface"],
+                           activebackground=THEME["bg"],
+                           activeforeground=THEME["text"], font=ui_font(10),
+                           relief="flat", cursor="hand2", highlightthickness=0,
+                           anchor="w").grid(row=i, column=0, sticky="w")
+
+        self._row_label("Opacity", 7, "w")
+        self.vop = tk.DoubleVar(value=self.cfg.get("opacity", 0.97))
+        tk.Scale(self, variable=self.vop, from_=OPACITY_MIN, to=OPACITY_MAX,
+                 resolution=0.01, orient="horizontal", bg=THEME["bg"],
+                 fg=THEME["text_dim"], troughcolor=THEME["surface"],
+                 activebackground=THEME["accent"], highlightthickness=0,
+                 relief="flat", bd=0, sliderrelief="flat", showvalue=True,
+                 font=ui_font(8), length=200
+                 ).grid(row=7, column=1, sticky="w", padx=16, pady=(0, 4))
+
+        bf = tk.Frame(self, bg=THEME["bg"])
+        bf.grid(row=8, column=0, columnspan=2, pady=14)
+        make_button(bf, "  Save  ", self._save, kind="primary",
+                    font=ui_font(10, "bold"), padx=18, pady=7).pack(side="left", padx=6)
+        make_button(bf, "Cancel", self.destroy, kind="flat",
+                    font=ui_font(10), padx=18, pady=7).pack(side="left", padx=6)
 
         self.columnconfigure(1, weight=1)
 
+    def _apply_preset(self, tc, cc):
+        self.tcv.set(tc)
+        self.ccv.set(cc)
+
     def _populate(self, zones):
+        """One batched insert - this used to add ~600 items one at a time on
+        every keystroke."""
         self.lb.delete(0, "end")
-        for z in zones: self.lb.insert("end", z)
+        if zones:
+            self.lb.insert("end", *zones)
 
     def _on_tz_change(self, *_):
+        if self._syncing:
+            return
         q = self.sv.get().lower()
         self._populate([z for z in ALL_ZONES if q in z.lower()])
-        if not self._user_edited_label:
-            city = self.sv.get().split("/")[-1].replace("_"," ")
-            self.e_lbl.delete(0,"end")
-            self.e_lbl.insert(0, city)
+        self._autofill_label(self.sv.get())
+
+    def _autofill_label(self, tz):
+        if self._user_edited_label:
+            return
+        city = tz.split("/")[-1].replace("_", " ")
+        self.e_lbl.delete(0, "end")
+        self.e_lbl.insert(0, city)
 
     def _on_lb_select(self, _):
-        s = self.lb.curselection()
-        if not s: return
-        tz_val = self.lb.get(s[0])
-        was_edited = self._user_edited_label
-        self.sv.set(tz_val)
-        if not was_edited:
-            city = tz_val.split("/")[-1].replace("_"," ")
-            self.e_lbl.delete(0,"end")
-            self.e_lbl.insert(0, city)
-            self._user_edited_label = False
+        sel = self.lb.curselection()
+        if not sel:
+            return
+        tz = self.lb.get(sel[0])
+        # Writing the entry used to re-run the filter and rebuild the list out
+        # from under the click, losing the selection.
+        self._syncing = True
+        try:
+            self.sv.set(tz)
+        finally:
+            self._syncing = False
+        self._autofill_label(tz)
 
     def _save(self):
         tz = self.sv.get().strip()
-        try: zoneinfo.ZoneInfo(tz)
-        except Exception:
+        try:
+            zoneinfo.ZoneInfo(tz)
+        except (zoneinfo.ZoneInfoNotFoundError, ValueError, OSError):
             tk.messagebox.showerror("Invalid Timezone",
-                                    f"'{tz}' is not valid.\nPick one from the list.")
+                                    f"'{tz}' is not a known timezone.\n"
+                                    "Pick one from the list.", parent=self)
             return
-        self.cfg["tz"]         = tz
-        self.cfg["label"]      = self.e_lbl.get().strip() or tz.split("/")[-1]
-        self.cfg["text_color"] = self.tcv.get()
-        self.cfg["card_color"] = self.ccv.get()
+        self.cfg.update({
+            "tz": tz,
+            "label": self.e_lbl.get().strip() or tz.split("/")[-1].replace("_", " "),
+            "text_color": self.tcv.get(),
+            "card_color": self.ccv.get(),
+            "hour24": bool(self.v24.get()),
+            "show_seconds": bool(self.vsec.get()),
+            "topmost": bool(self.vtop.get()),
+            "opacity": round(float(self.vop.get()), 2),
+        })
         self.on_save()
         self.destroy()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+#  App mark
+# ---------------------------------------------------------------------------
+_ICON_PHOTO = None
+
+
+def make_app_icon(size=64):
+    """The Solari mark: a flip card with a clock face on it."""
+    if not HAS_PIL:
+        return None
+    s = 4
+    S_ = size * s
+    img = Image.new("RGBA", (S_, S_), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    r = int(S_ * 0.22)
+    d.rounded_rectangle([0, 0, S_ - 1, S_ - 1], radius=r, fill=(30, 30, 34, 255))
+    d.rounded_rectangle([0, 0, S_ - 1, int(S_ * 0.5)], radius=r,
+                        fill=(46, 46, 52, 255))
+    d.rounded_rectangle([0, 0, S_ - 1, S_ - 1], radius=r,
+                        outline=(255, 255, 255, 40), width=max(1, s))
+    m = int(S_ * 0.20)
+    d.ellipse([m, m, S_ - m, S_ - m], outline=(255, 255, 255, 255), width=int(s * 2.6))
+    cx = cy = S_ // 2
+    d.line([cx, cy, cx, cy - int(S_ * 0.20)], fill=(255, 255, 255, 255), width=int(s * 2.6))
+    d.line([cx, cy, cx + int(S_ * 0.16), cy + int(S_ * 0.11)],
+           fill=(255, 255, 255, 255), width=int(s * 2.6))
+    return img.resize((size, size), Image.LANCZOS)
+
+
+def apply_window_icon(win):
+    global _ICON_PHOTO
+    ico = asset_path("solari.ico")
+    if ico and IS_WINDOWS:
+        try:
+            win.iconbitmap(ico)
+            return
+        except tk.TclError:
+            pass
+    if not HAS_PIL:
+        return
+    try:
+        if _ICON_PHOTO is None:
+            _ICON_PHOTO = ImageTk.PhotoImage(make_app_icon(64))
+        win.iconphoto(False, _ICON_PHOTO)
+    except tk.TclError:
+        pass
+
+
+# ---------------------------------------------------------------------------
 #  ManagerWindow
-# ─────────────────────────────────────────────────────────────────────────────
+#
+#  Now lists the clocks it manages: without this there was no way to reach a
+#  clock that had drifted off-screen, or to see what you owned.
+# ---------------------------------------------------------------------------
+MGR_W = 396          # inner content width
+ROW_H = 42
+
+
+class ClockRow(tk.Canvas):
+    """One clock in the manager list: a raised surface striped in its colour.
+
+    The controls are tagged canvas items rather than child widgets - the same
+    approach ClockWindow uses for its own chrome - so a long list does not carry
+    three extra widgets per row.  Everything re-lays out on <Configure>, which
+    matters when the scrollbar appears and narrows the list.
+    """
+
+    def __init__(self, parent, win, app, width):
+        self.win = win
+        self.app = app
+        self._cw = width
+        self._images = {}          # strong refs, or the row paints blank
+        self._accent = win.cfg.get("text_color", "#ffffff")
+        super().__init__(parent, width=width, height=ROW_H, bd=0,
+                         highlightthickness=0, bg=THEME["well"], takefocus=0)
+
+        self._bg = self.create_image(0, 0, anchor="nw") if HAS_PIL else None
+        if not HAS_PIL:
+            self.configure(bg=THEME["surface"])
+        self._stripe = self.create_rectangle(0, 8, 3, ROW_H - 8,
+                                             fill=self._accent, outline="")
+        self.create_text(16, ROW_H // 2, anchor="w",
+                         text=win.cfg.get("label", ""), fill=THEME["text"],
+                         font=ui_font(10, "bold"))
+
+        self._buttons = []
+        for label, cmd, hover, font in (
+                ("✕", lambda: app.remove_clock(win), THEME["danger"], ui_font(11)),
+                ("Find", lambda: app.recall(win), THEME["text"], ui_font(9)),
+                ("✎", lambda: app.edit_clock(win), self._accent, ui_font(11)),
+        ):
+            tag = f"b{len(self._buttons)}"
+            item = self.create_text(0, ROW_H // 2, anchor="e", text=label,
+                                    fill=THEME["text_faint"], font=font,
+                                    tags=(tag,))
+            self.tag_bind(tag, "<Button-1>", lambda e, c=cmd: c())
+            self.tag_bind(tag, "<Enter>", lambda e, t=tag, c=hover: (
+                self.itemconfigure(t, fill=c), self.configure(cursor="hand2")))
+            self.tag_bind(tag, "<Leave>", lambda e, t=tag: (
+                self.itemconfigure(t, fill=THEME["text_faint"]),
+                self.configure(cursor="")))
+            self._buttons.append(item)
+
+        self._clock = self.create_text(0, ROW_H // 2, anchor="e", text="",
+                                       fill=THEME["text_dim"], font=ui_font(10))
+        self.bind("<Enter>", lambda e: self._paint(True))
+        self.bind("<Leave>", lambda e: self._paint(False))
+        self.bind("<Configure>", self._on_configure)
+        self._layout()
+        self._paint(False)
+
+    def _layout(self):
+        x = self._cw - 14
+        for item in self._buttons:
+            self.coords(item, x, ROW_H // 2)
+            box = self.bbox(item)
+            x -= (box[2] - box[0]) + 14
+        self.coords(self._clock, x - 4, ROW_H // 2)
+
+    def _paint(self, hover):
+        if self._bg is None:
+            self.configure(bg=THEME["surface_hi"] if hover else THEME["surface"])
+            return
+        key = (hover, self._cw)
+        photo = self._images.get(key)
+        if photo is None:
+            photo = ImageTk.PhotoImage(render_surface(
+                self._cw, ROW_H, 8,
+                THEME["surface_hi"] if hover else THEME["surface"],
+                THEME["well"], strength=0.6))
+            self._images[key] = photo
+        self.itemconfigure(self._bg, image=photo)
+
+    def _on_configure(self, e):
+        if e.width == self._cw:
+            return
+        self._cw = e.width
+        self._layout()
+        self._paint(False)
+
+    def tick(self):
+        now = datetime.datetime.now(self.win.zone())
+        fmt = "%H:%M:%S" if self.win.cfg.get("hour24", True) else "%I:%M:%S %p"
+        self.itemconfigure(self._clock, text=now.strftime(fmt))
+
+
+
 class ManagerWindow(tk.Toplevel):
-    def __init__(self, master, on_add, on_quit, on_startup_toggle, startup_var):
+    """The manager, drawn with the same surfaces as the clocks it manages."""
+
+    def __init__(self, master, app):
         super().__init__(master)
-        self.title("Solari")
-        self.configure(bg="#0d0d0d")
+        self.app = app
+        self._rows = []
+        self._photos = {}          # strong refs for hero / row images
+        self.title(APP_NAME)
+        self.configure(bg=THEME["bg"])
         self.resizable(False, False)
-        self.wm_attributes("-topmost", True)
         self.protocol("WM_DELETE_WINDOW", self._hide)
-        self._on_add  = on_add
-        self._on_quit = on_quit
-        self._on_st   = on_startup_toggle
-        self._sv      = startup_var
+        apply_window_icon(self)
         self._build()
 
     def _hide(self):
-        # Only hide to tray if tray is available — otherwise quitting is safer
-        # than leaving the app running with no way to get it back
-        if HAS_TRAY:
+        # Without a tray icon there would be no way back, so quitting is safer
+        if HAS_TRAY and self.app.tray_active():
             self.withdraw()
         else:
-            self._on_quit()
-    def show(self):  self.deiconify(); self.lift()
+            self.app.quit_app()
 
+    def show(self):
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+
+    # -- construction ------------------------------------------------------
     def _build(self):
-        top = tk.Frame(self, bg="#0d0d0d", pady=28, padx=32)
-        top.pack(fill="x")
-        tk.Label(top, text="🕐", bg="#0d0d0d", fg="#ffffff",
-                 font=("Segoe UI Emoji", 36)).pack()
-        tk.Label(top, text="Solari", bg="#0d0d0d", fg="#ffffff",
-                 font=("Segoe UI", 22, "bold")).pack(pady=(8,3))
-        tk.Label(top, text="Floating flip-clock widgets for your desktop",
-                 bg="#0d0d0d", fg="#555555", font=("Segoe UI",11)).pack()
+        pad = 22
+        outer = tk.Frame(self, bg=THEME["bg"], padx=pad, pady=pad)
+        outer.pack(fill="both", expand=True)
+        inner = MGR_W - pad * 2
 
-        tk.Frame(self, bg="#222222", height=1).pack(fill="x")
+        self._build_hero(outer, inner)
 
-        tk.Label(self, text="Drag ◢ corner to resize   ·   Drag anywhere to move",
-                 bg="#0d0d0d", fg="#383838", font=("Segoe UI",10)).pack(pady=(12,4))
+        cap = tk.Frame(outer, bg=THEME["bg"])
+        cap.pack(fill="x", pady=(18, 6))
+        tk.Label(cap, text="CLOCKS", bg=THEME["bg"], fg=THEME["text_faint"],
+                 font=ui_font(9, "bold")).pack(side="left")
+        self._count = tk.Label(cap, text="", bg=THEME["bg"],
+                               fg=THEME["text_faint"], font=ui_font(9))
+        self._count.pack(side="right")
 
-        btn_f = tk.Frame(self, bg="#0d0d0d", padx=28, pady=10)
-        btn_f.pack(fill="x")
+        # The list sits in the well colour, so rows read as recessed into it.
+        self.list = ScrollFrame(outer, height=(ROW_H + 4) * 4 + 4, bg=THEME["well"])
+        self.list.pack(fill="x")
+        self._row_w = inner
 
-        tk.Button(btn_f, text="＋  Add Clock", command=self._on_add,
-                  bg="#1e3a5f", fg="#ffffff", font=("Segoe UI",12,"bold"),
-                  relief="flat", pady=12, cursor="hand2",
-                  activebackground="#2a4a7f").pack(fill="x", pady=(0,10))
+        body = tk.Frame(outer, bg=THEME["bg"])
+        body.pack(fill="x", pady=(14, 0))
+        make_button(body, "＋   Add Clock", self.app.add_clock, kind="primary",
+                    font=ui_font(12, "bold"), pady=11).pack(fill="x")
+        make_button(body, "Bring all on screen", self.app.recall_all,
+                    kind="ghost", font=ui_font(10), pady=8).pack(fill="x", pady=(8, 0))
 
-        st_f = tk.Frame(btn_f, bg="#151515")
-        st_f.pack(fill="x", pady=(0,8))
-        tk.Label(st_f, text="  Launch at Windows startup",
-                 bg="#151515", fg="#aaaaaa", font=("Segoe UI",11)
-                 ).pack(side="left", pady=8)
-        tk.Checkbutton(st_f, variable=self._sv, command=self._on_st,
-                       bg="#151515", selectcolor="#1e3a5f",
-                       activebackground="#151515", relief="flat",
-                       cursor="hand2").pack(side="right", padx=10)
+        st = tk.Frame(body, bg=THEME["surface"])
+        st.pack(fill="x", pady=(12, 8))
+        tk.Label(st, text="   Launch at Windows startup", bg=THEME["surface"],
+                 fg=THEME["text_dim"] if HAS_WINREG else THEME["text_faint"],
+                 font=ui_font(10)).pack(side="left", pady=9)
+        self._startup = ToggleSwitch(st, self.app.startup_var,
+                                     command=self.app.toggle_startup,
+                                     behind=THEME["surface"])
+        self._startup.pack(side="right", padx=9)
+        if not HAS_WINREG:
+            self._startup.set_enabled(False)
 
-        tk.Button(btn_f, text="Quit", command=self._on_quit,
-                  bg="#1a1a1a", fg="#666666", font=("Segoe UI",11),
-                  relief="flat", pady=10, cursor="hand2",
-                  activeforeground="#ff5555").pack(fill="x")
+        make_button(body, "Quit", self.app.quit_app, kind="danger",
+                    font=ui_font(10), pady=8).pack(fill="x")
 
-        tk.Frame(self, bg="#1a1a1a", height=1).pack(fill="x", pady=(12,0))
-        foot = tk.Frame(self, bg="#0d0d0d", pady=12)
-        foot.pack(fill="x")
-        tk.Label(foot, text="Config  %APPDATA%\\Solari",
-                 bg="#0d0d0d", fg="#2a2a2a", font=("Segoe UI",9)).pack()
-        tk.Label(foot, text="by  Cervezagua",
-                 bg="#0d0d0d", fg="#333333", font=("Segoe UI",10,"italic")).pack(pady=(5,0))
+        foot = tk.Frame(outer, bg=THEME["bg"])
+        foot.pack(fill="x", pady=(16, 0))
+        tk.Frame(foot, bg=THEME["divider"], height=1).pack(fill="x", pady=(0, 10))
+        tk.Label(foot, text=pretty_path(config_dir()), bg=THEME["bg"],
+                 fg=THEME["text_faint"], font=ui_font(8)).pack()
+        tk.Label(foot, text="by  Cervezagua", bg=THEME["bg"],
+                 fg=THEME["text_faint"], font=ui_font(9, "italic")).pack(pady=(3, 0))
 
-        self.minsize(360, 0)
+        self.minsize(MGR_W, 0)
         self.update_idletasks()
 
+    def _build_hero(self, parent, width):
+        """The banner: one rendered panel, with the mark and titles on top."""
+        h = 92
+        cv = tk.Canvas(parent, width=width, height=h, bd=0, highlightthickness=0,
+                       bg=THEME["bg"], takefocus=0)
+        cv.pack(fill="x")
+        if HAS_PIL:
+            self._photos["hero"] = ImageTk.PhotoImage(render_surface(
+                width, h, 12, THEME["surface"], THEME["bg"], strength=0.75))
+            cv.create_image(0, 0, anchor="nw", image=self._photos["hero"])
+            self._photos["mark"] = ImageTk.PhotoImage(make_app_icon(44))
+            cv.create_image(24, h // 2, anchor="w", image=self._photos["mark"])
+            tx = 84
+        else:
+            cv.configure(bg=THEME["surface"])
+            tx = 24
+        cv.create_text(tx, h // 2 - 11, anchor="w", text="Solari",
+                       fill=THEME["text"], font=ui_font(20, "bold"))
+        cv.create_text(tx, h // 2 + 13, anchor="w",
+                       text="Floating flip-clock widgets",
+                       fill=THEME["text_faint"], font=ui_font(10))
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Tray icon
-# ─────────────────────────────────────────────────────────────────────────────
-def _make_tray_image():
-    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-    d   = ImageDraw.Draw(img)
-    d.ellipse([4, 4, 60, 60], outline="white", width=4)
-    d.line([32, 14, 32, 34], fill="white", width=4)
-    d.line([32, 34, 46, 48], fill="white", width=4)
-    return img
+    # -- clock list --------------------------------------------------------
+    def refresh_list(self):
+        for child in self.list.body.winfo_children():
+            child.destroy()
+        self._rows = []
+        for win in self.app.windows:
+            self._rows.append(self._make_row(win))
+        n = len(self.app.windows)
+        self._count.configure(text=f"{n} clock" + ("" if n == 1 else "s"))
+        self.on_second(time.time())
+
+    def _make_row(self, win):
+        row = ClockRow(self.list.body, win, self.app, self._row_w)
+        row.pack(fill="x", pady=2)
+        return row
+
+    def on_second(self, _ts):
+        """Live preview in each row - the Manager rides the same shared tick."""
+        for row in self._rows:
+            try:
+                row.tick()
+            except tk.TclError:
+                pass
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 #  App
-# ─────────────────────────────────────────────────────────────────────────────
-COLOR_CYCLE = ["#ffffff","#2277ff","#cc0000","#00aa00","#ffd700","#8833cc"]
-
+# ---------------------------------------------------------------------------
 class App(tk.Tk):
+
     def __init__(self):
         super().__init__()
         self.withdraw()
-        self.title("Solari")
-        self.windows: list[ClockWindow] = []
-        self._tray   = None
-        self._load()
-        self._sv = tk.BooleanVar(value=get_startup())
-        self.mgr = ManagerWindow(self,
-                                  on_add=self._add,
-                                  on_quit=self._quit,
-                                  on_startup_toggle=self._toggle_startup,
-                                  startup_var=self._sv)
+        self.title(APP_NAME)
+        resolve_fonts(self)
+        self._apply_tk_scaling()
+        apply_window_icon(self)
+
+        self.ticker = Ticker(self)
+        self.configs = load_config()
+        self.windows = []
+        self._tray = None
+        self.startup_var = tk.BooleanVar(value=get_startup())
+
+        self.mgr = ManagerWindow(self, self)
         for cfg in self.configs:
             self._spawn(cfg)
-        self.protocol("WM_DELETE_WINDOW", self._quit)
+        self.ticker.subscribe(self.mgr)
+        self.ticker.start()
+        self.mgr.refresh_list()
+
+        self.protocol("WM_DELETE_WINDOW", self.quit_app)
         if HAS_TRAY:
             self._start_tray()
 
-    def _load(self):
+    def _apply_tk_scaling(self):
+        """Let point-sized UI text follow the display DPI.
+
+        Clock-face text is specified in pixels (negative Tk sizes) so it stays
+        locked to the pixel-sized cards and is unaffected by this.
+        """
         try:
-            with open(config_path()) as f:
-                data = json.load(f)
-            assert isinstance(data, list) and len(data) > 0
-            for c in data:
-                if "text_color" not in c:
-                    c["text_color"] = c.pop("color","#ffffff")
-                if "card_color" not in c:
-                    c["card_color"] = PAL_DARK.get(c.get("text_color","#ffffff"),"#1e1e1e")
-                if "scale" not in c:
-                    c["scale"] = 1.0
-                # migrate old greys
-                if c.get("text_color") in ("#bbbbbb","#ddcc00"):
-                    c["text_color"] = "#ffffff"
-            self.configs = data
-        except Exception:
-            self.configs = [dict(c) for c in DEFAULT_CONFIG]
+            dpi = self.winfo_fpixels("1i")
+            if dpi and dpi > 0:
+                self.tk.call("tk", "scaling", dpi / 72.0)
+        except tk.TclError:
+            pass
 
-    def _save(self):
-        try:
-            with open(config_path(),"w") as f:
-                json.dump(self.configs, f, indent=2)
-        except Exception: pass
-
-    def _start_tray(self):
-        import threading, traceback
-
-        log_path = os.path.join(config_dir(), "tray_error.log")
-
-        def _tray_thread():
-            try:
-                menu = pystray.Menu(
-                    pystray.MenuItem("Show Manager", lambda: self.after(0, self.mgr.show), default=True),
-                    pystray.MenuItem("Add Clock",    lambda: self.after(0, self._add)),
-                    pystray.Menu.SEPARATOR,
-                    pystray.MenuItem("Quit",         lambda: self.after(0, self._quit)),
-                )
-                icon = pystray.Icon("Solari", _make_tray_image(), "Solari", menu)
-                self._tray = icon
-
-                def _setup(ic):
-                    ic.visible = True
-
-                icon.run(setup=_setup)
-            except Exception:
-                with open(log_path, "w") as f:
-                    traceback.print_exc(file=f)
-                self._tray = None
-                # Show manager as fallback so user isn't stranded
-                self.after(0, self.mgr.deiconify)
-
-        threading.Thread(target=_tray_thread, daemon=True).start()
-
-    def _toggle_startup(self):
-        if not set_startup(self._sv.get()):
-            tk.messagebox.showwarning("Startup",
-                "Could not modify startup registry.\nTry running as administrator.")
-            self._sv.set(not self._sv.get())
-
+    # -- clocks ------------------------------------------------------------
     def _spawn(self, cfg):
-        w = ClockWindow(self, cfg, on_close=self._remove, on_edit=self._edit)
-        self.windows.append(w)
+        win = ClockWindow(self, cfg, self.ticker, on_close=self.remove_clock,
+                          on_edit=self.edit_clock, peers=lambda: self.windows)
+        self.windows.append(win)
+        return win
 
-    def _add(self):
-        n  = len(self.configs)
+    def add_clock(self):
+        n = len(self.configs)
         tc = COLOR_CYCLE[n % len(COLOR_CYCLE)]
-        cfg = {"tz":"UTC","label":"UTC",
-               "x":150+n*40,"y":150+n*30,
-               "text_color":tc,
-               "card_color":PAL_DARK.get(tc,"#1e1e1e"),
-               "scale":1.0}
+        cfg = dict(DEFAULT_CLOCK, tz="UTC", label="UTC",
+                   x=150 + n * 40, y=150 + n * 30,
+                   text_color=tc, card_color=PAL_DARK.get(tc, "#1e1e1e"))
         self.configs.append(cfg)
-        self._spawn(cfg)
-        self._edit(self.windows[-1])
-        self._save()
+        win = self._spawn(cfg)
+        self.mgr.refresh_list()
+        self.save()
+        self.edit_clock(win)
 
-    def _remove(self, win):
-        if win.cfg in self.configs: self.configs.remove(win.cfg)
-        if win in self.windows:     self.windows.remove(win)
+    def remove_clock(self, win):
+        if not tk.messagebox.askyesno(
+                "Remove clock",
+                f"Remove “{win.cfg.get('label', '')}”?",
+                parent=self.mgr if self.mgr.winfo_ismapped() else None):
+            return
+        # Match on identity: list.remove() compares by value, so two clocks with
+        # identical settings could drop the wrong entry.
+        self.configs = [c for c in self.configs if c is not win.cfg]
+        if win in self.windows:
+            self.windows.remove(win)
         win.destroy()
-        self._save()
+        self.mgr.refresh_list()
+        self.save()
 
-    def _edit(self, win):
+    def edit_clock(self, win):
         def saved():
             win.refresh_style()
-            self._save()
-        EditDialog(self, win.cfg, saved)
+            self.mgr.refresh_list()
+            self.save()
+        EditDialog(self.mgr, win.cfg, saved)
 
-    def _quit(self):
-        self._save()
-        # Stop tray first — its thread must not touch tkinter after destroy()
-        if self._tray:
-            try: self._tray.stop()
-            except: pass
+    def recall(self, win):
+        win.recall()
+        self.save()
+
+    def recall_all(self):
+        for i, win in enumerate(self.windows):
+            win.recall(40 + i * 30, 40 + i * 26)
+        self.save()
+
+    def save(self):
+        save_config(self.configs)
+
+    # -- startup -----------------------------------------------------------
+    def toggle_startup(self):
+        if not set_startup(self.startup_var.get()):
+            self.startup_var.set(not self.startup_var.get())
+            tk.messagebox.showwarning(
+                "Startup",
+                "Could not update the Windows startup entry."
+                if HAS_WINREG else
+                "Launch at startup is only available on Windows.",
+                parent=self.mgr)
+
+    # -- tray --------------------------------------------------------------
+    def tray_active(self):
+        return self._tray is not None
+
+    def _start_tray(self):
+        import threading
+        import traceback
+
+        def run():
+            try:
+                menu = pystray.Menu(
+                    pystray.MenuItem("Show Manager",
+                                     lambda: self.after(0, self.mgr.show), default=True),
+                    pystray.MenuItem("Add Clock", lambda: self.after(0, self.add_clock)),
+                    pystray.Menu.SEPARATOR,
+                    pystray.MenuItem("Quit", lambda: self.after(0, self.quit_app)),
+                )
+                icon = pystray.Icon(APP_NAME, make_app_icon(64), APP_NAME, menu)
+                self._tray = icon
+                icon.run(setup=lambda ic: setattr(ic, "visible", True))
+            except Exception:
+                with open(os.path.join(config_dir(), "tray_error.log"),
+                          "w", encoding="utf-8") as f:
+                    traceback.print_exc(file=f)
+                self._tray = None
+                self.after(0, self.mgr.deiconify)   # don't strand the user
+
+        threading.Thread(target=run, daemon=True).start()
+
+    # -- shutdown ----------------------------------------------------------
+    def quit_app(self):
+        self.save()
+        self.ticker.stop()
+        # Stop the tray first: its thread must not touch Tk after destroy()
+        if self._tray is not None:
+            try:
+                self._tray.stop()
+            except Exception:
+                pass
             self._tray = None
-        # Explicitly destroy all clock windows to cancel their after() callbacks
         for win in list(self.windows):
-            try: win.destroy()
-            except: pass
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
         self.windows.clear()
-        # Finally destroy the root window
-        try: self.destroy()
-        except: pass
+        try:
+            self.destroy()
+        except tk.TclError:
+            pass
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    enable_dpi_awareness()
+    app = App()
+    if "--selftest" in argv:
+        # Start every window, run real ticks, quit.  CI uses this against the
+        # frozen exe, where a missing hidden import only shows up at runtime.
+        app.after(1500, app.quit_app)
+        app.mainloop()
+        print(f"selftest OK - {len(app.configs)} clocks, "
+              f"Pillow={HAS_PIL}, tray={HAS_TRAY}")
+        return 0
+    app.mainloop()
+    return 0
 
 
 if __name__ == "__main__":
-    App().mainloop()
+    sys.exit(main())
