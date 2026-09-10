@@ -321,7 +321,7 @@ class Rendering(unittest.TestCase):
         behind = S.THEME["well"]
         card = S.render_card(82, 104, 12, "#1e1e1e", None, behind, False)
         surface = S.render_surface(82, 104, 12, "#1e1e1e", behind)
-        self.assertEqual(list(card.getdata()), list(surface.getdata()))
+        self.assertEqual(card.tobytes(), surface.tobytes())
 
     def test_card_has_requested_size_and_is_opaque(self):
         img = S.render_card(82, 104, 12, "#1e1e1e", None, S.THEME["well"], False)
@@ -517,6 +517,23 @@ class RenderedWidgets(unittest.TestCase):
         sw.event_generate("<Button-1>", x=10, y=10)
         self.root.update()
         self.assertTrue(var.get())
+
+    def test_toggle_destroyed_mid_slide_leaves_nothing_pending(self):
+        """A queued frame must be cancelled on destroy: Tk deletes the command
+        behind the widget, so the callback cannot guard itself."""
+        var = tk.BooleanVar(value=False)
+        sw = S.ToggleSwitch(self.root, var)
+        sw.pack()
+        self.root.update()
+        var.set(True)
+        self.root.update()
+        self.assertIsNotNone(sw._job, "should be mid-slide")
+        sw.destroy()
+        self.root.update()
+        self.assertIsNone(sw._job)
+        # The trace must be gone too, or writes keep reaching a dead widget.
+        var.set(False)
+        self.root.update()
 
     def test_disabled_toggle_ignores_clicks(self):
         var = tk.BooleanVar(value=False)

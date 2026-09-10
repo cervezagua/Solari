@@ -1585,6 +1585,7 @@ class ToggleSwitch(tk.Canvas):
         self._pos = 1.0 if variable.get() else 0.0
         self._target = self._pos
         self._t0 = None
+        self._job = None
         self._photos = {}
         super().__init__(parent, width=self.W, height=self.H, bd=0,
                          highlightthickness=0, bg=self._behind, takefocus=0,
@@ -1593,7 +1594,28 @@ class ToggleSwitch(tk.Canvas):
         self._knob = self.create_image(0, 0, anchor="nw")
         self.bind("<Button-1>", self._clicked)
         self._trace = variable.trace_add("write", lambda *_: self._sync())
+        self.bind("<Destroy>", self._teardown)
         self._draw()
+
+    def _teardown(self, _=None):
+        """Drop the pending frame and the variable trace.
+
+        winfo_exists() inside the callback is not enough: destroying the widget
+        deletes the Tcl command behind it, so a queued `after` fires against a
+        name that no longer resolves and Tk reports a background error.
+        """
+        if self._job is not None:
+            try:
+                self.after_cancel(self._job)
+            except tk.TclError:
+                pass
+            self._job = None
+        if self._trace is not None:
+            try:
+                self.var.trace_remove("write", self._trace)
+            except (tk.TclError, ValueError):
+                pass
+            self._trace = None
 
     def _photo(self, key, *args, **kwargs):
         photo = self._photos.get(key)
@@ -1630,9 +1652,11 @@ class ToggleSwitch(tk.Canvas):
             return
         self._t0 = time.perf_counter()
         self._start = self._pos
-        self._animate()
+        if self._job is None:
+            self._animate()
 
     def _animate(self):
+        self._job = None
         if not self.winfo_exists():
             return
         t = (time.perf_counter() - self._t0) / self.DURATION
@@ -1642,7 +1666,7 @@ class ToggleSwitch(tk.Canvas):
             return
         self._pos = self._start + (self._target - self._start) * smoothstep(t)
         self._draw()
-        self.after(FRAME_MS, self._animate)
+        self._job = self.after(FRAME_MS, self._animate)
 
     def set_enabled(self, enabled):
         self._enabled = bool(enabled)
