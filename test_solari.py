@@ -442,6 +442,32 @@ class ClockWindowBehaviour(unittest.TestCase):
         for key in ("h1", "h2"):
             self.assertIsNotNone(shown_digit(self.win._cards[key]))
 
+    @unittest.skipUnless(S.HAS_PIL, "Pillow not installed")
+    def test_chassis_reaches_every_window_edge(self):
+        """No outer mat.
+
+        The panel used to sit inset inside a black surround, which read as a
+        border drawn around the widget. An overrideredirect Tk window has no
+        transparency to blend into, so any inset is simply visible black.
+        """
+        for scale in (0.4, 1.0, 2.2):
+            self.win._scale = scale
+            L = self.win._layout()
+            self.assertEqual(L["pad"], 0, f"outer mat came back at scale {scale}")
+            img = S.render_chassis(L["w"], L["h"], L["pad"], L["r"],
+                                   L["well"], None)
+            w, h = img.size
+            edges = {
+                "top": img.getpixel((w // 2, 0)),
+                "bottom": img.getpixel((w // 2, h - 1)),
+                "left": img.getpixel((0, h // 2)),
+                "right": img.getpixel((w - 1, h // 2)),
+            }
+            for name, px in edges.items():
+                self.assertGreater(
+                    sum(px), 12,
+                    f"{name} edge is black at scale {scale} - the mat is back")
+
     def test_digits_survive_a_rescale(self):
         self.win.on_second(time.time(), animate=True)
         self._settle_all()

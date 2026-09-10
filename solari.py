@@ -1018,8 +1018,11 @@ class ClockWindow(tk.Toplevel):
     def _layout(self):
         s = self._scale
         L = {
-            "pad": max(5, int(8 * s)),
-            "r": max(8, int(16 * s)),
+            # No outer mat: the panel runs to the window edge.  Any inset here
+            # shows up as a black border around the widget, because an
+            # overrideredirect Tk window has no transparency to blend into.
+            "pad": 0,
+            "r": max(5, int(11 * s)),
             "mx": max(8, int(14 * s)),
             "my": max(6, int(10 * s)),
             "hdr": max(16, int(26 * s)),
