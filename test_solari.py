@@ -909,12 +909,18 @@ class AppBehaviour(unittest.TestCase):
         """The manager bound the mouse wheel application-wide, so scrolling
         anywhere - the editor's zone list, say - scrolled the manager."""
         sf = self.app.mgr.list
-        self.assertEqual(self.app.tk.call("bind", "all", "<MouseWheel>"), "")
-        sf._capture()
-        self.assertNotEqual(self.app.tk.call("bind", "all", "<MouseWheel>"), "")
-        with mock.patch.object(sf, "winfo_pointerxy", return_value=(-9999, -9999)):
+        bound = lambda: self.app.tk.call("bind", "all", "<MouseWheel>") != ""
+        outside = mock.patch.object(sf, "winfo_pointerxy", return_value=(-9999, -9999))
+        # The pointer may start over the list (CI's screen is small), so
+        # begin from a known state: pointer elsewhere.
+        with outside:
             sf._release()
-        self.assertEqual(self.app.tk.call("bind", "all", "<MouseWheel>"), "")
+        self.assertFalse(bound())
+        sf._capture()                         # pointer enters the list
+        self.assertTrue(bound())
+        with outside:
+            sf._release()                     # and leaves it
+        self.assertFalse(bound())
 
     def test_regression_tray_never_calls_tk_from_its_thread(self):
         """Tray menu callbacks called self.after() from pystray's thread;
