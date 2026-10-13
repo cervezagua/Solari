@@ -57,9 +57,8 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
-      # pystray too, so the tray hand-off runs against the real Win32 tray.
       - name: Install dependencies
-        run: python -m pip install --upgrade pip Pillow tzdata pystray
+        run: python -m pip install --upgrade pip Pillow tzdata
 
       - name: Fonts
         run: python solari.py --fonts
@@ -98,16 +97,15 @@ jobs:
           import base64, io, os
           from PIL import Image
           print(open(os.path.join("screenshots", "report.txt"), encoding="utf-8").read())
-          for name in ("manager.png", "editor.png", "editor_new.png", "manager_empty.png",
-                       "clock_0.png", "desktop.png", "presets.png"):
+          for name in ("manager.png", "editor.png"):
               im = Image.open(os.path.join("screenshots", name)).convert("RGB")
-              im.thumbnail((1100, 1100))
+              im.thumbnail((560, 560))
               buf = io.BytesIO()
-              im.save(buf, "JPEG", quality=90)
+              im.save(buf, "JPEG", quality=62, optimize=True)
               data = base64.b64encode(buf.getvalue()).decode()
               print("BEGIN", name, im.size)
-              for i in range(0, len(data), 4000):
-                  print(data[i:i + 4000])
+              for i in range(0, len(data), 8000):
+                  print(data[i:i + 8000])
               print("END", name)
 
       - uses: actions/upload-artifact@v6

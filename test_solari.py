@@ -60,7 +60,11 @@ def temp_app(clocks=None, **kw):
     if clocks is not None:
         with open(path, "w", encoding="utf-8") as f:
             json.dump({"version": S.CONFIG_VERSION, "clocks": clocks}, f)
-    with mock.patch.object(S, "config_dir", lambda: d):
+    # No real tray icon: creating and removing one per test makes Windows
+    # broadcast to every Tk interpreter in the process, dead ones included.
+    # The tray logic is tested with a fake; the frozen-exe selftest in CI
+    # runs the real one.
+    with mock.patch.object(S, "config_dir", lambda: d), mock.patch.object(S, "HAS_TRAY", False):
         app = S.App(config_file=path, **kw)
     app._test_dir = d
     app.update()
@@ -983,12 +987,12 @@ class AppBehaviour(unittest.TestCase):
                 raise ValueError("boom")
 
         self.app.ticker._clocks.insert(0, Broken())       # first in line
-        card = self.app.windows[0]._cards["s2"]
-        before = card._cur
+        booms = lambda: sum("boom" in e for e in self.app.errors)
+        # Two failures in a row can only happen if the timer survived the
+        # first: before the fix, the exception ended the tick chain.
         with mock.patch.object(S.sys, "stderr", None), \
                 mock.patch.object(S, "config_dir", lambda: self.app._test_dir):
-            self.assertTrue(pump(self.app, 3, until=lambda: card._cur != before))
-        self.assertTrue(any("boom" in e for e in self.app.errors))
+            self.assertTrue(pump(self.app, 4, until=lambda: booms() >= 2))
         self.app.errors.clear()
 
     def test_saves_on_session_end(self):
