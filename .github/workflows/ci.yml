@@ -88,26 +88,6 @@ jobs:
       - name: Take screenshots
         run: python solari.py --screenshot screenshots
 
-      # TEMPORARY: a compact copy in the log, for review from an environment
-      # that cannot download artifacts.  Removed before merge.
-      - name: Screenshots in the log
-        if: always()
-        shell: python
-        run: |
-          import base64, io, os
-          from PIL import Image
-          print(open(os.path.join("screenshots", "report.txt"), encoding="utf-8").read())
-          for name in ("manager.png", "editor.png"):
-              im = Image.open(os.path.join("screenshots", name)).convert("RGB")
-              im.thumbnail((560, 560))
-              buf = io.BytesIO()
-              im.save(buf, "JPEG", quality=62, optimize=True)
-              data = base64.b64encode(buf.getvalue()).decode()
-              print("BEGIN", name, im.size)
-              for i in range(0, len(data), 8000):
-                  print(data[i:i + 8000])
-              print("END", name)
-
       - uses: actions/upload-artifact@v6
         if: always()
         with:

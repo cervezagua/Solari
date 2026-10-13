@@ -5281,6 +5281,13 @@ def run_screenshots(out_dir):
     steps = []
 
     def shot(name, win):
+        # Clocks are always on top and CI's desktop is small: lift the
+        # window being shot above them for the moment it takes.
+        try:
+            win.wm_attributes("-topmost", True)
+            win.lift()
+        except tk.TclError:
+            pass
         try:
             size = _grab(win, os.path.join(out_dir, name))
             report.append(f"{name} {size[0]}x{size[1]}")
