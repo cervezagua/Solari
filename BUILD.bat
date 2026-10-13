@@ -64,6 +64,8 @@ REM the Scripts directory is often not on PATH yet, and the bare command fails.
   --hidden-import PIL.Image ^
   --hidden-import PIL.ImageDraw ^
   --hidden-import PIL.ImageFilter ^
+  --hidden-import PIL.ImageFont ^
+  --hidden-import PIL.ImageGrab ^
   --hidden-import PIL.ImageTk ^
   --collect-all tzdata ^
   --collect-all pystray ^

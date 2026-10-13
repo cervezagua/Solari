@@ -31,6 +31,7 @@ jobs:
         run: |
           python3 --version
           python3 -c "import tkinter, PIL; print('tk', tkinter.TkVersion, '| Pillow', PIL.__version__)"
+          python3 solari.py --fonts
 
       - name: Lint
         run: python3 -m pyflakes solari.py test_solari.py
@@ -56,8 +57,12 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
+      # pystray too, so the tray hand-off runs against the real Win32 tray.
       - name: Install dependencies
-        run: python -m pip install --upgrade pip Pillow tzdata
+        run: python -m pip install --upgrade pip Pillow tzdata pystray
+
+      - name: Fonts
+        run: python solari.py --fonts
 
       # Windows runners have a real display, so the GUI tests run for real on
       # the platform Solari actually targets.
@@ -66,6 +71,30 @@ jobs:
 
       - name: App starts
         run: python solari.py --selftest
+
+  screenshots:
+    name: Screenshots (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip Pillow tzdata pystray
+
+      # Drives the real app on a real Windows desktop and grabs the screen,
+      # so the UI can be reviewed from any machine.
+      - name: Take screenshots
+        run: python solari.py --screenshot screenshots
+
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: Solari-screenshots
+          path: screenshots/
+          if-no-files-found: error
 
   build:
     name: Build EXE (Windows)
